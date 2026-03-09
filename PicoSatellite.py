@@ -3,17 +3,20 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 import io
 import json
+import math
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
 DB_PATH = "weather.db"
-
 app = Flask(__name__)
 
-# Change these to fit each station and plant setup
-# For bog plants, you probably want much wetter targets than a normal bed.
+DEFAULT_HOURS = 24
+ALLOWED_WINDOWS = [1, 24, 168]
+ONLINE_AFTER_MINUTES = 5
+STALE_AFTER_MINUTES = 30
+
 STATION_RULES = {
     "default": {
         "label": "General zone",
@@ -33,8 +36,11 @@ STATION_RULES = {
     },
 }
 
-DEFAULT_HOURS = 24
-ALLOWED_WINDOWS = [1, 24, 168]
+PROBES = [
+    {"key": "soil_moisture_1_pct", "raw_key": "soil_raw_1", "default_name": "Probe 1"},
+    {"key": "soil_moisture_2_pct", "raw_key": "soil_raw_2", "default_name": "Probe 2"},
+]
+PROBE_INDEX = {p["key"]: p for p in PROBES}
 
 
 def db():
@@ -43,17 +49,158 @@ def db():
     return conn
 
 
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
 def utc_now_iso():
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return utc_now().replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def parse_iso(ts):
-    # Handles strings like 2026-03-08T02:30:20Z
-    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
 
 
-def get_rules(station_id):
-    return STATION_RULES.get(station_id, STATION_RULES["default"])
+def safe_num(v, default=0.0):
+    try:
+        if v is None or v == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def get_base_rules(station_id):
+    return STATION_RULES.get(station_id, STATION_RULES["default"]).copy()
+
+
+def clamp_hours(v):
+    v = int(v or DEFAULT_HOURS)
+    return v if v in ALLOWED_WINDOWS else DEFAULT_HOURS
+
+
+def clamp_percent(v, fallback):
+    try:
+        num = float(v)
+    except Exception:
+        return float(fallback)
+    return max(0.0, min(100.0, num))
+
+
+def age_text(ts):
+    delta = utc_now() - parse_iso(ts)
+    seconds = max(0, int(delta.total_seconds()))
+    if seconds < 60:
+        return f"{seconds}s ago"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours}h ago"
+    days = hours // 24
+    return f"{days}d ago"
+
+
+def connectivity_meta(ts):
+    minutes = (utc_now() - parse_iso(ts)).total_seconds() / 60.0
+    if minutes <= ONLINE_AFTER_MINUTES:
+        return {"state": "online", "label": "Online"}
+    if minutes <= STALE_AFTER_MINUTES:
+        return {"state": "stale", "label": "Stale"}
+    return {"state": "offline", "label": "Offline"}
+
+
+def current_value_from_row(row, probe_key):
+    probe = PROBE_INDEX[probe_key]
+    raw = safe_num(row[probe["raw_key"]], 65535)
+    val = safe_num(row[probe_key], 0)
+    if raw >= 65535 or val < 0 or val > 100:
+        return None
+    return val
+
+
+def station_value_from_row(row):
+    vals = []
+    for probe in PROBES:
+        val = current_value_from_row(row, probe["key"])
+        if val is not None:
+            vals.append(val)
+    if vals:
+        return sum(vals) / len(vals)
+    return None
+
+
+def value_state(value, rules):
+    if value is None:
+        return {"cls": "nodata", "text": "No live data"}
+    if value < rules["danger_low"]:
+        return {"cls": "bad", "text": "Too dry"}
+    if value < rules["warn_low"]:
+        return {"cls": "warn", "text": "Dry side"}
+    if value <= rules["target_high"]:
+        return {"cls": "ok", "text": "On target"}
+    if value <= rules["warn_high"]:
+        return {"cls": "warn", "text": "Very wet"}
+    return {"cls": "bad", "text": "Extreme wet"}
+
+
+def probe_value_sql(probe_key):
+    if probe_key not in PROBE_INDEX:
+        raise ValueError("unknown probe")
+    raw_key = PROBE_INDEX[probe_key]["raw_key"]
+    return f"CASE WHEN {raw_key} >= 65535 OR {probe_key} < 0 OR {probe_key} > 100 THEN NULL ELSE {probe_key} END"
+
+
+def ensure_station_defaults(conn, station_id):
+    base = get_base_rules(station_id)
+    conn.execute("""
+        INSERT INTO station_config (station_id, display_name, description, default_hours, is_collapsed)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(station_id) DO NOTHING
+    """, (station_id, station_id, base["label"], DEFAULT_HOURS, 0))
+
+    for probe in PROBES:
+        conn.execute("""
+            INSERT INTO probe_config (
+                station_id, probe_key, display_name, location_name,
+                danger_low, warn_low, target_low, target_high, warn_high, enabled
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(station_id, probe_key) DO NOTHING
+        """, (
+            station_id,
+            probe["key"],
+            probe["default_name"],
+            "",
+            base["danger_low"],
+            base["warn_low"],
+            base["target_low"],
+            base["target_high"],
+            base["warn_high"],
+        ))
+
+
+def get_station_config(conn, station_id):
+    ensure_station_defaults(conn, station_id)
+    row = conn.execute("""
+        SELECT station_id, display_name, description, default_hours, is_collapsed
+        FROM station_config
+        WHERE station_id = ?
+    """, (station_id,)).fetchone()
+    return dict(row)
+
+
+def get_probe_configs(conn, station_id):
+    ensure_station_defaults(conn, station_id)
+    rows = conn.execute("""
+        SELECT station_id, probe_key, display_name, location_name,
+               danger_low, warn_low, target_low, target_high, warn_high, enabled
+        FROM probe_config
+        WHERE station_id = ?
+        ORDER BY probe_key
+    """, (station_id,)).fetchall()
+    return {row["probe_key"]: dict(row) for row in rows}
 
 
 def init_db():
@@ -68,8 +215,8 @@ def init_db():
         soil_moisture_pct REAL NOT NULL DEFAULT 0,
         soil_moisture_1_pct REAL NOT NULL DEFAULT 0,
         soil_moisture_2_pct REAL NOT NULL DEFAULT 0,
-        soil_raw_1 REAL NOT NULL DEFAULT 0,
-        soil_raw_2 REAL NOT NULL DEFAULT 0,
+        soil_raw_1 REAL NOT NULL DEFAULT 65535,
+        soil_raw_2 REAL NOT NULL DEFAULT 65535,
         eco2_ppm REAL NOT NULL DEFAULT 0
     )
     """)
@@ -78,51 +225,75 @@ def init_db():
     needed = {
         "soil_moisture_1_pct": "REAL NOT NULL DEFAULT 0",
         "soil_moisture_2_pct": "REAL NOT NULL DEFAULT 0",
-        "soil_raw_1": "REAL NOT NULL DEFAULT 0",
-        "soil_raw_2": "REAL NOT NULL DEFAULT 0",
+        "soil_raw_1": "REAL NOT NULL DEFAULT 65535",
+        "soil_raw_2": "REAL NOT NULL DEFAULT 65535",
         "eco2_ppm": "REAL NOT NULL DEFAULT 0",
         "air_temp_c": "REAL NOT NULL DEFAULT 0",
         "humidity_pct": "REAL NOT NULL DEFAULT 0",
         "soil_moisture_pct": "REAL NOT NULL DEFAULT 0",
     }
-
     for col, coltype in needed.items():
         if col not in existing:
             conn.execute(f"ALTER TABLE readings ADD COLUMN {col} {coltype}")
 
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS station_config (
+        station_id TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL DEFAULT '',
+        description TEXT NOT NULL DEFAULT '',
+        default_hours INTEGER NOT NULL DEFAULT 24,
+        is_collapsed INTEGER NOT NULL DEFAULT 0
+    )
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS probe_config (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        station_id TEXT NOT NULL,
+        probe_key TEXT NOT NULL,
+        display_name TEXT NOT NULL DEFAULT '',
+        location_name TEXT NOT NULL DEFAULT '',
+        danger_low REAL NOT NULL,
+        warn_low REAL NOT NULL,
+        target_low REAL NOT NULL,
+        target_high REAL NOT NULL,
+        warn_high REAL NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        UNIQUE(station_id, probe_key)
+    )
+    """)
     conn.commit()
     conn.close()
-
-
-def safe_num(v):
-    try:
-        if v is None:
-            return 0.0
-        return float(v)
-    except Exception:
-        return 0.0
 
 
 @app.route("/ingest", methods=["POST"])
 def ingest():
     payload = request.get_json(force=True, silent=True) or {}
-    station_id = str(payload.get("station_id", "unknown"))
+    station_id = str(payload.get("station_id", "unknown")).strip() or "unknown"
     ts = utc_now_iso()
 
     air_temp_c = safe_num(payload.get("air_temp_c", 0))
     humidity_pct = safe_num(payload.get("humidity_pct", 0))
     eco2_ppm = safe_num(payload.get("eco2_ppm", 0))
 
-    soil_moisture_pct = safe_num(payload.get("soil_moisture_pct", 0))
-    soil_moisture_1_pct = safe_num(payload.get("soil_moisture_1_pct", 0))
-    soil_moisture_2_pct = safe_num(payload.get("soil_moisture_2_pct", 0))
-    soil_raw_1 = safe_num(payload.get("soil_raw_1", 0))
-    soil_raw_2 = safe_num(payload.get("soil_raw_2", 0))
+    soil_raw_1 = safe_num(payload.get("soil_raw_1", 65535), 65535)
+    soil_raw_2 = safe_num(payload.get("soil_raw_2", 65535), 65535)
+    soil_1 = safe_num(payload.get("soil_moisture_1_pct", 0), 0)
+    soil_2 = safe_num(payload.get("soil_moisture_2_pct", 0), 0)
 
-    if soil_moisture_pct == 0 and (soil_moisture_1_pct or soil_moisture_2_pct):
-        soil_moisture_pct = (soil_moisture_1_pct + soil_moisture_2_pct) / 2.0
+    valid = []
+    if soil_raw_1 < 65535:
+        valid.append(soil_1)
+    if soil_raw_2 < 65535:
+        valid.append(soil_2)
+
+    if valid:
+        soil_avg = sum(valid) / len(valid)
+    else:
+        soil_avg = safe_num(payload.get("soil_moisture_pct", 0), 0)
 
     conn = db()
+    ensure_station_defaults(conn, station_id)
     conn.execute("""
         INSERT INTO readings (
             station_id, ts, air_temp_c, humidity_pct,
@@ -132,25 +303,17 @@ def ingest():
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         station_id, ts, air_temp_c, humidity_pct,
-        soil_moisture_pct, soil_moisture_1_pct, soil_moisture_2_pct,
+        soil_avg, soil_1, soil_2,
         soil_raw_1, soil_raw_2, eco2_ppm
     ))
     conn.commit()
     conn.close()
-
     return jsonify({"ok": True})
 
 
-@app.route("/api/stations")
-def api_stations():
-    hours = request.args.get("hours", default=DEFAULT_HOURS, type=int)
-    if hours not in ALLOWED_WINDOWS:
-        hours = DEFAULT_HOURS
-
-    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
+@app.route("/api/dashboard")
+def api_dashboard():
     conn = db()
-
     latest_rows = conn.execute("""
         SELECT r1.*
         FROM readings r1
@@ -159,86 +322,223 @@ def api_stations():
             FROM readings
             GROUP BY station_id
         ) r2
-        ON r1.station_id = r2.station_id AND r1.ts = r2.max_ts
+          ON r1.station_id = r2.station_id
+         AND r1.ts = r2.max_ts
         ORDER BY r1.station_id
     """).fetchall()
 
     results = []
     for row in latest_rows:
         station_id = row["station_id"]
+        station_cfg = get_station_config(conn, station_id)
+        probe_cfgs = get_probe_configs(conn, station_id)
+        station_current = station_value_from_row(row)
 
-        stats = conn.execute("""
-            SELECT
-                COUNT(*) AS points,
-                AVG(soil_moisture_pct) AS avg_station,
-                AVG(soil_moisture_1_pct) AS avg_probe1,
-                AVG(soil_moisture_2_pct) AS avg_probe2
-            FROM readings
-            WHERE station_id = ? AND ts >= ?
-        """, (station_id, since)).fetchone()
+        probes = []
+        alert_count = 0
+        for probe in PROBES:
+            probe_cfg = probe_cfgs[probe["key"]]
+            current = current_value_from_row(row, probe["key"])
+            rules = {
+                "danger_low": probe_cfg["danger_low"],
+                "warn_low": probe_cfg["warn_low"],
+                "target_low": probe_cfg["target_low"],
+                "target_high": probe_cfg["target_high"],
+                "warn_high": probe_cfg["warn_high"],
+            }
+            state = value_state(current, rules)
+            if state["cls"] in ("warn", "bad"):
+                alert_count += 1
+            probes.append({
+                "probe_key": probe["key"],
+                "raw_key": probe["raw_key"],
+                "display_name": probe_cfg["display_name"] or probe["default_name"],
+                "location_name": probe_cfg["location_name"] or "",
+                "current": current,
+                "raw": safe_num(row[probe["raw_key"]], 65535),
+                "enabled": bool(probe_cfg["enabled"]),
+                "rules": rules,
+                "state": state,
+            })
 
-        item = dict(row)
-        item["window_hours"] = hours
-        item["window_points"] = int(stats["points"] or 0)
-        item["avg_station_window"] = safe_num(stats["avg_station"])
-        item["avg_probe1_window"] = safe_num(stats["avg_probe1"])
-        item["avg_probe2_window"] = safe_num(stats["avg_probe2"])
-        item["rules"] = get_rules(station_id)
-        results.append(item)
+        results.append({
+            "station_id": station_id,
+            "display_name": station_cfg["display_name"] or station_id,
+            "description": station_cfg["description"] or "",
+            "default_hours": clamp_hours(station_cfg["default_hours"]),
+            "is_collapsed": bool(station_cfg["is_collapsed"]),
+            "updated_at": row["ts"],
+            "updated_ago": age_text(row["ts"]),
+            "connectivity": connectivity_meta(row["ts"]),
+            "station_state": value_state(station_current, get_base_rules(station_id)),
+            "probe_count": len(probes),
+            "alert_count": alert_count,
+            "probes": probes,
+        })
 
     conn.close()
     return jsonify(results)
 
 
-@app.route("/plot/<station_id>.svg")
-def plot_station(station_id):
-    hours = request.args.get("hours", default=DEFAULT_HOURS, type=int)
-    if hours not in ALLOWED_WINDOWS:
-        hours = DEFAULT_HOURS
+@app.route("/api/probe-metrics/<station_id>/<probe_key>")
+def api_probe_metrics(station_id, probe_key):
+    if probe_key not in PROBE_INDEX:
+        return jsonify({"error": "Unknown probe"}), 404
 
-    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    hours = clamp_hours(request.args.get("hours", DEFAULT_HOURS, type=int))
+    since = (utc_now() - timedelta(hours=hours)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    expr = probe_value_sql(probe_key)
 
     conn = db()
-    rows = conn.execute("""
-        SELECT ts, soil_moisture_pct, soil_moisture_1_pct, soil_moisture_2_pct
+    stats = conn.execute(f"""
+        SELECT
+            COUNT({expr}) AS points,
+            AVG({expr}) AS avg_value,
+            MIN({expr}) AS min_value,
+            MAX({expr}) AS max_value
+        FROM readings
+        WHERE station_id = ? AND ts >= ?
+    """, (station_id, since)).fetchone()
+    conn.close()
+
+    return jsonify({
+        "hours": hours,
+        "points": int(stats["points"] or 0),
+        "avg": None if stats["avg_value"] is None else float(stats["avg_value"]),
+        "min": None if stats["min_value"] is None else float(stats["min_value"]),
+        "max": None if stats["max_value"] is None else float(stats["max_value"]),
+    })
+
+
+@app.route("/api/config/<station_id>", methods=["POST"])
+def api_save_config(station_id):
+    payload = request.get_json(force=True, silent=True) or {}
+    station = payload.get("station", {}) or {}
+    probes = payload.get("probes", {}) or {}
+
+    conn = db()
+    ensure_station_defaults(conn, station_id)
+    current_station = get_station_config(conn, station_id)
+
+    display_name = str(station.get("display_name", current_station["display_name"])).strip() or station_id
+    description = str(station.get("description", current_station["description"])).strip()
+    default_hours = clamp_hours(station.get("default_hours", current_station["default_hours"]))
+    is_collapsed = 1 if bool(station.get("is_collapsed", current_station["is_collapsed"])) else 0
+
+    conn.execute("""
+        INSERT INTO station_config (station_id, display_name, description, default_hours, is_collapsed)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(station_id) DO UPDATE SET
+            display_name = excluded.display_name,
+            description = excluded.description,
+            default_hours = excluded.default_hours,
+            is_collapsed = excluded.is_collapsed
+    """, (station_id, display_name, description, default_hours, is_collapsed))
+
+    current_probes = get_probe_configs(conn, station_id)
+    for probe_key, probe_data in probes.items():
+        if probe_key not in PROBE_INDEX:
+            continue
+        old = current_probes[probe_key]
+        display_name = str(probe_data.get("display_name", old["display_name"])).strip() or PROBE_INDEX[probe_key]["default_name"]
+        location_name = str(probe_data.get("location_name", old["location_name"])).strip()
+        enabled = 1 if bool(probe_data.get("enabled", old["enabled"])) else 0
+
+        danger_low = clamp_percent(probe_data.get("danger_low"), old["danger_low"])
+        warn_low = clamp_percent(probe_data.get("warn_low"), old["warn_low"])
+        target_low = clamp_percent(probe_data.get("target_low"), old["target_low"])
+        target_high = clamp_percent(probe_data.get("target_high"), old["target_high"])
+        warn_high = clamp_percent(probe_data.get("warn_high"), old["warn_high"])
+
+        if not (danger_low <= warn_low <= target_low <= target_high <= warn_high):
+            return jsonify({"error": f"Bad threshold order for {probe_key}"}), 400
+
+        conn.execute("""
+            INSERT INTO probe_config (
+                station_id, probe_key, display_name, location_name,
+                danger_low, warn_low, target_low, target_high, warn_high, enabled
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(station_id, probe_key) DO UPDATE SET
+                display_name = excluded.display_name,
+                location_name = excluded.location_name,
+                danger_low = excluded.danger_low,
+                warn_low = excluded.warn_low,
+                target_low = excluded.target_low,
+                target_high = excluded.target_high,
+                warn_high = excluded.warn_high,
+                enabled = excluded.enabled
+        """, (
+            station_id, probe_key, display_name, location_name,
+            danger_low, warn_low, target_low, target_high, warn_high, enabled
+        ))
+
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/plot/<station_id>/<probe_key>.svg")
+def plot_probe(station_id, probe_key):
+    if probe_key not in PROBE_INDEX:
+        return Response("Unknown probe", status=404)
+
+    hours = clamp_hours(request.args.get("hours", DEFAULT_HOURS, type=int))
+    since = (utc_now() - timedelta(hours=hours)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    probe = PROBE_INDEX[probe_key]
+
+    conn = db()
+    ensure_station_defaults(conn, station_id)
+    probe_cfgs = get_probe_configs(conn, station_id)
+    cfg = probe_cfgs[probe_key]
+    rows = conn.execute(f"""
+        SELECT ts, {probe_key} AS probe_value, {probe['raw_key']} AS raw_value
         FROM readings
         WHERE station_id = ? AND ts >= ?
         ORDER BY ts ASC
     """, (station_id, since)).fetchall()
     conn.close()
 
-    fig, ax = plt.subplots(figsize=(10, 3.8))
+    fig, ax = plt.subplots(figsize=(10, 3.3))
+    values = []
+    times = []
 
-    if rows:
-        times = [parse_iso(r["ts"]) for r in rows]
-        soil_avg = [safe_num(r["soil_moisture_pct"]) for r in rows]
-        soil1 = [safe_num(r["soil_moisture_1_pct"]) for r in rows]
-        soil2 = [safe_num(r["soil_moisture_2_pct"]) for r in rows]
+    for row in rows:
+        times.append(parse_iso(row["ts"]))
+        raw = safe_num(row["raw_value"], 65535)
+        val = safe_num(row["probe_value"], 0)
+        if raw >= 65535 or val < 0 or val > 100:
+            values.append(math.nan)
+        else:
+            values.append(val)
 
-        ax.plot(times, soil_avg, label="Avg %", linewidth=2.3)
-        ax.plot(times, soil1, label="Probe 1 %", linewidth=1.7)
-        ax.plot(times, soil2, label="Probe 2 %", linewidth=1.7)
+    valid_points = sum(0 if math.isnan(v) else 1 for v in values)
 
-        rules = get_rules(station_id)
-        ax.axhspan(rules["target_low"], rules["target_high"], alpha=0.08)
+    if valid_points:
+        ax.axhspan(cfg["target_low"], cfg["target_high"], alpha=0.10)
+        ax.axhline(cfg["warn_low"], linewidth=1.0, alpha=0.35, linestyle="--")
+        ax.axhline(cfg["warn_high"], linewidth=1.0, alpha=0.35, linestyle="--")
+        ax.plot(times, values, linewidth=2.4)
+        ax.set_ylim(0, 100)
+        ax.set_ylabel("Soil moisture %")
+        ax.grid(True, alpha=0.28)
+        if hours <= 1:
+            locator = mdates.MinuteLocator(interval=10)
+        elif hours <= 24:
+            locator = mdates.HourLocator(interval=2)
+        else:
+            locator = mdates.DayLocator(interval=1)
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
     else:
-        ax.text(0.5, 0.5, "No data in selected window", ha="center", va="center", transform=ax.transAxes)
+        ax.text(0.5, 0.54, "No valid data in selected window", ha="center", va="center", transform=ax.transAxes)
+        ax.text(0.5, 0.40, "Live status still uses the most recent reading.", ha="center", va="center", fontsize=9, transform=ax.transAxes)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
 
-    ax.set_title(f"{station_id} · last {hours}h")
-    ax.set_ylabel("Soil moisture %")
-    ax.set_ylim(0, 100)
-    ax.grid(True, alpha=0.35)
-    ax.legend(loc="upper left")
-
-    if hours <= 1:
-        locator = mdates.MinuteLocator(interval=10)
-    elif hours <= 24:
-        locator = mdates.HourLocator(interval=2)
-    else:
-        locator = mdates.DayLocator(interval=1)
-
-    ax.xaxis.set_major_locator(locator)
-    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+    ax.set_title(f"{cfg['display_name']} · last {hours}h")
     fig.tight_layout()
 
     buf = io.StringIO()
@@ -258,19 +558,27 @@ def home():
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     :root {
-      --bg: #f4f6f8;
+      --bg: #eef2f5;
       --panel: #ffffff;
-      --text: #17212b;
-      --muted: #5b6573;
-      --border: #d9e0e7;
-      --shadow: 0 8px 24px rgba(19, 33, 48, 0.07);
-      --ok-bg: #e9f8ee;
-      --ok-border: #7bc693;
-      --warn-bg: #fff6df;
-      --warn-border: #e6b44a;
-      --bad-bg: #fdecec;
-      --bad-border: #de7878;
-      --accent: #2f6fed;
+      --panel-soft: #f8fafc;
+      --text: #16202a;
+      --muted: #667281;
+      --border: #d7dee6;
+      --shadow: 0 12px 32px rgba(17, 28, 40, 0.08);
+      --ok-bg: #eaf8ef;
+      --ok-border: #8ac89d;
+      --warn-bg: #fff5de;
+      --warn-border: #e3b454;
+      --bad-bg: #fdeaea;
+      --bad-border: #de7b7b;
+      --nodata-bg: #f2f5f8;
+      --nodata-border: #cbd5df;
+      --accent: #2d6cdf;
+      --accent-soft: #e7efff;
+      --online: #37b24d;
+      --stale: #f59f00;
+      --offline: #e03131;
+      --radius: 18px;
     }
 
     * { box-sizing: border-box; }
@@ -278,7 +586,7 @@ def home():
     body {
       margin: 0;
       font-family: Arial, sans-serif;
-      background: var(--bg);
+      background: linear-gradient(180deg, #f6f8fb 0%, #eef2f5 100%);
       color: var(--text);
     }
 
@@ -290,172 +598,377 @@ def home():
 
     .topbar {
       display: flex;
+      align-items: end;
       justify-content: space-between;
-      align-items: center;
       gap: 16px;
       flex-wrap: wrap;
-      margin-bottom: 18px;
+      margin-bottom: 20px;
     }
 
     h1 {
-      margin: 0;
-      font-size: 2rem;
+      margin: 0 0 6px;
+      font-size: 2.1rem;
+      line-height: 1.05;
     }
 
-    .toolbar {
-      display: flex;
-      gap: 10px;
-      align-items: center;
-      flex-wrap: wrap;
+    .subhead {
+      color: var(--muted);
+      font-size: 1rem;
+    }
+
+    .global-note {
       background: var(--panel);
       border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 10px 12px;
+      border-radius: 16px;
+      padding: 12px 14px;
       box-shadow: var(--shadow);
-    }
-
-    .toolbar label {
-      font-weight: 700;
       color: var(--muted);
-    }
-
-    .toolbar select {
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 8px 10px;
-      background: white;
       font-size: 0.95rem;
     }
 
-    .hint {
+    .empty, .loading {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+      box-shadow: var(--shadow);
+    }
+
+    .station {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 22px;
+      box-shadow: var(--shadow);
+      margin-bottom: 18px;
+      overflow: hidden;
+    }
+
+    .station summary {
+      list-style: none;
+      cursor: pointer;
+      padding: 16px 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      background: linear-gradient(180deg, #ffffff 0%, #fbfcfd 100%);
+    }
+
+    .station summary::-webkit-details-marker { display: none; }
+
+    .summary-left {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex: 1;
+    }
+
+    .status-dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 999px;
+      flex: 0 0 12px;
+      box-shadow: 0 0 0 3px rgba(0,0,0,0.04);
+    }
+
+    .status-dot.online { background: var(--online); }
+    .status-dot.stale { background: var(--stale); }
+    .status-dot.offline { background: var(--offline); }
+
+    .summary-text {
+      min-width: 0;
+      flex: 1;
+    }
+
+    .station-name {
+      font-size: 1.2rem;
+      font-weight: 800;
+      margin: 0 0 3px;
+      line-height: 1.15;
+    }
+
+    .station-meta {
+      color: var(--muted);
+      font-size: 0.95rem;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .summary-right {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border-radius: 999px;
+      padding: 8px 12px;
+      border: 1px solid var(--border);
+      background: var(--panel-soft);
+      font-size: 0.92rem;
+      font-weight: 700;
+    }
+
+    .pill.ok { background: var(--ok-bg); border-color: var(--ok-border); }
+    .pill.warn { background: var(--warn-bg); border-color: var(--warn-border); }
+    .pill.bad { background: var(--bad-bg); border-color: var(--bad-border); }
+    .pill.nodata { background: var(--nodata-bg); border-color: var(--nodata-border); }
+
+    .count-badge {
+      background: var(--accent-soft);
+      color: var(--accent);
+      border-color: #cddcff;
+    }
+
+    .station-body {
+      padding: 0 18px 18px;
+      border-top: 1px solid var(--border);
+      background: #fbfcfd;
+    }
+
+    .station-info {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 10px 16px;
+      padding: 14px 0 8px;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+
+    .section-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 14px;
+    }
+
+    .settings {
+      margin: 8px 0 16px;
+    }
+
+    .settings summary {
+      padding: 0;
+      background: transparent;
+      border: none;
+      box-shadow: none;
+      display: inline-flex;
+      justify-content: flex-start;
+      gap: 8px;
+      font-weight: 700;
+      color: var(--accent);
+    }
+
+    .settings summary::-webkit-details-marker { display: none; }
+
+    .settings-wrap {
+      margin-top: 14px;
+      display: grid;
+      gap: 14px;
+    }
+
+    .fields {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    }
+
+    .field {
+      display: grid;
+      gap: 6px;
+    }
+
+    .field span {
+      color: var(--muted);
+      font-size: 0.84rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+
+    .field input, .field select {
+      width: 100%;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 10px 12px;
+      background: #fff;
+      font-size: 0.95rem;
+      color: var(--text);
+    }
+
+    .probe-settings {
+      display: grid;
+      gap: 12px;
+    }
+
+    .probe-settings-card {
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 12px;
+      background: #fcfdff;
+    }
+
+    .probe-settings-title {
+      margin: 0 0 10px;
+      font-size: 1rem;
+      font-weight: 800;
+    }
+
+    .settings-actions {
+      display: flex;
+      justify-content: flex-end;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .save-msg {
       color: var(--muted);
       font-size: 0.92rem;
     }
 
-    .station-card {
+    button {
+      border: 0;
+      border-radius: 12px;
+      background: var(--accent);
+      color: white;
+      padding: 10px 14px;
+      font-size: 0.95rem;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    button.secondary {
+      background: #eef4ff;
+      color: var(--accent);
+      border: 1px solid #d5e2ff;
+    }
+
+    .probe-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 14px;
+    }
+
+    .probe-card {
       background: var(--panel);
       border: 1px solid var(--border);
       border-radius: 18px;
-      padding: 18px;
-      margin-bottom: 18px;
-      box-shadow: var(--shadow);
+      padding: 14px;
+      display: grid;
+      gap: 12px;
     }
 
-    .station-head {
+    .probe-card.ok { border-color: var(--ok-border); background: linear-gradient(180deg, #ffffff 0%, #f7fcf9 100%); }
+    .probe-card.warn { border-color: var(--warn-border); background: linear-gradient(180deg, #ffffff 0%, #fffaf0 100%); }
+    .probe-card.bad { border-color: var(--bad-border); background: linear-gradient(180deg, #ffffff 0%, #fff5f5 100%); }
+    .probe-card.nodata { border-color: var(--nodata-border); background: linear-gradient(180deg, #ffffff 0%, #f7f9fb 100%); }
+
+    .probe-head {
       display: flex;
       justify-content: space-between;
+      gap: 10px;
       align-items: start;
-      gap: 12px;
       flex-wrap: wrap;
-      margin-bottom: 16px;
     }
 
-    .station-title {
-      margin: 0;
-      font-size: 1.35rem;
+    .probe-name {
+      margin: 0 0 4px;
+      font-size: 1.12rem;
+      font-weight: 800;
     }
 
-    .station-sub {
+    .probe-sub {
       color: var(--muted);
-      margin-top: 4px;
       font-size: 0.95rem;
     }
 
-    .pill {
-      display: inline-block;
-      padding: 8px 12px;
-      border-radius: 999px;
-      font-weight: 700;
-      border: 1px solid var(--border);
+    .probe-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .range-wrap {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
       background: #f7f9fb;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 8px 10px;
     }
 
-    .pill.ok {
-      background: var(--ok-bg);
-      border-color: var(--ok-border);
+    .range-wrap label {
+      color: var(--muted);
+      font-size: 0.88rem;
+      font-weight: 700;
     }
 
-    .pill.warn {
-      background: var(--warn-bg);
-      border-color: var(--warn-border);
+    .range-wrap select {
+      border: 0;
+      background: transparent;
+      font-size: 0.95rem;
+      color: var(--text);
+      outline: none;
     }
 
-    .pill.bad {
-      background: var(--bad-bg);
-      border-color: var(--bad-border);
-    }
-
-    .stats {
+    .metrics {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-      gap: 12px;
-      margin-bottom: 16px;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
     }
 
-    .stat {
+    .metric {
       border: 1px solid var(--border);
       border-radius: 14px;
       padding: 12px;
       background: #fcfdff;
     }
 
-    .stat.ok {
-      background: var(--ok-bg);
-      border-color: var(--ok-border);
-    }
-
-    .stat.warn {
-      background: var(--warn-bg);
-      border-color: var(--warn-border);
-    }
-
-    .stat.bad {
-      background: var(--bad-bg);
-      border-color: var(--bad-border);
-    }
-
-    .label {
+    .metric-label {
       color: var(--muted);
-      font-size: 0.85rem;
+      font-size: 0.80rem;
       margin-bottom: 6px;
-      font-weight: 700;
       text-transform: uppercase;
-      letter-spacing: 0.03em;
+      letter-spacing: 0.04em;
+      font-weight: 800;
     }
 
-    .value {
-      font-size: 1.35rem;
-      font-weight: 700;
+    .metric-value {
+      font-size: 1.18rem;
+      font-weight: 800;
+      line-height: 1.1;
     }
 
-    .value.small {
-      font-size: 1rem;
+    .metric-note {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 0.82rem;
     }
 
-    .meter-wrap {
-      margin-top: 10px;
-    }
-
-    .meter {
-      width: 100%;
-      height: 10px;
-      border-radius: 999px;
-      background: #e9eef4;
-      overflow: hidden;
-      border: 1px solid #d8e0e9;
-    }
-
-    .meter > span {
-      display: block;
-      height: 100%;
-      background: var(--accent);
+    .target-band {
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 12px;
+      background: #f8fbff;
     }
 
     .plot-box {
       border: 1px solid var(--border);
       border-radius: 16px;
-      padding: 12px;
+      padding: 10px;
       background: #fbfcfe;
+      min-height: 180px;
     }
 
     .plot-box img {
@@ -464,26 +977,45 @@ def home():
       border-radius: 10px;
     }
 
-    .empty {
-      background: white;
-      border: 1px solid var(--border);
-      border-radius: 18px;
-      padding: 24px;
-      box-shadow: var(--shadow);
+    .tech summary {
+      padding: 0;
+      background: transparent;
+      border: none;
+      box-shadow: none;
+      font-weight: 700;
+      color: var(--muted);
+      display: inline-flex;
+      gap: 8px;
+      justify-content: flex-start;
     }
 
-    @media (max-width: 700px) {
-      .wrap {
-        padding: 14px;
-      }
+    .tech summary::-webkit-details-marker { display: none; }
 
-      h1 {
-        font-size: 1.6rem;
-      }
+    .tech-grid {
+      margin-top: 10px;
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    }
 
-      .value {
-        font-size: 1.15rem;
-      }
+    .tech-item {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 10px;
+      background: #fcfdff;
+    }
+
+    .tiny {
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+
+    @media (max-width: 760px) {
+      .wrap { padding: 14px; }
+      h1 { font-size: 1.65rem; }
+      .metrics { grid-template-columns: 1fr; }
+      .station summary { padding: 14px; align-items: flex-start; }
+      .summary-right { justify-content: flex-start; }
     }
   </style>
 </head>
@@ -492,168 +1024,382 @@ def home():
     <div class="topbar">
       <div>
         <h1>Weather Station Host</h1>
-        <div class="hint">Auto-refreshes every 60 seconds</div>
+        <div class="subhead">Auto-refreshes every 60 seconds · each probe has its own graph range</div>
       </div>
-
-      <div class="toolbar">
-        <label for="rangeSelect">Graph range</label>
-        <select id="rangeSelect">
-          <option value="1">Last 1 hour</option>
-          <option value="24" selected>Last 24 hours</option>
-          <option value="168">Last 7 days</option>
-        </select>
-      </div>
+      <div class="global-note">Tip: open a unit, rename probes, and adjust thresholds live from the settings panel.</div>
     </div>
 
-    <div id="content" class="empty">Loading...</div>
+    <div id="content" class="loading">Loading dashboard…</div>
   </div>
 
   <script>
-    const STATION_RULES = __RULES_JSON__;
     const DEFAULT_HOURS = __DEFAULT_HOURS__;
+    const ALLOWED_WINDOWS = __ALLOWED_WINDOWS__;
 
-    function stationRules(stationId) {
-      return STATION_RULES[stationId] || STATION_RULES.default;
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
     }
 
-    function moistureState(value, rules) {
-      value = Number(value);
-
-      if (value < rules.danger_low) {
-        return { cls: "bad", text: "Too dry" };
-      }
-      if (value < rules.warn_low) {
-        return { cls: "warn", text: "Dry side" };
-      }
-      if (value <= rules.target_high) {
-        return { cls: "ok", text: "On target" };
-      }
-      if (value <= rules.warn_high) {
-        return { cls: "warn", text: "Very wet" };
-      }
-      return { cls: "bad", text: "Extreme wet" };
+    function fmtPct(value) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return "—";
+      return Number(value).toFixed(1) + " %";
     }
 
-    function fmtPct(v) {
-      return Number(v || 0).toFixed(1) + " %";
+    function fmtRaw(value) {
+      if (value === null || value === undefined) return "—";
+      const n = Number(value);
+      if (!Number.isFinite(n) || n >= 65535) return "No reading";
+      return n.toFixed(0);
     }
 
-    function fmtRaw(v) {
-      return Number(v || 0).toFixed(0);
+    function fmtRange(rules) {
+      return `${Number(rules.target_low).toFixed(0)}%–${Number(rules.target_high).toFixed(0)}%`;
     }
 
-    function fmtTimestamp(ts) {
-      const d = new Date(ts);
-      if (Number.isNaN(d.getTime())) return ts;
-      return new Intl.DateTimeFormat(undefined, {
-        dateStyle: "medium",
-        timeStyle: "short"
-      }).format(d);
+    function formatWindow(hours) {
+      if (Number(hours) === 1) return "1h";
+      if (Number(hours) === 24) return "24h";
+      return "7d";
     }
 
-    function barWidth(v) {
-      const n = Math.max(0, Math.min(100, Number(v || 0)));
-      return n.toFixed(1) + "%";
+    function stateClass(state) {
+      return state?.cls || "nodata";
     }
 
-    async function load() {
-      const hours = Number(document.getElementById("rangeSelect").value || DEFAULT_HOURS);
-      const res = await fetch("/api/stations?hours=" + hours);
+    function loadExpandedState(stationId, fallbackCollapsed) {
+      const key = `station-open:${stationId}`;
+      const saved = localStorage.getItem(key);
+      if (saved !== null) return saved === "1";
+      return !fallbackCollapsed;
+    }
+
+    function saveExpandedState(stationId, open) {
+      localStorage.setItem(`station-open:${stationId}`, open ? "1" : "0");
+    }
+
+    function getProbeHours(stationId, probeKey, fallback) {
+      const key = `probe-hours:${stationId}:${probeKey}`;
+      const saved = Number(localStorage.getItem(key));
+      if (ALLOWED_WINDOWS.includes(saved)) return saved;
+      return fallback;
+    }
+
+    function setProbeHours(stationId, probeKey, hours) {
+      localStorage.setItem(`probe-hours:${stationId}:${probeKey}`, String(hours));
+    }
+
+    function renderProbeSettings(station) {
+      return station.probes.map((probe) => `
+        <div class="probe-settings-card">
+          <div class="probe-settings-title">${escapeHtml(probe.display_name || probe.probe_key)}</div>
+          <div class="fields">
+            <label class="field">
+              <span>Probe name</span>
+              <input type="text" data-probe-key="${escapeHtml(probe.probe_key)}" data-probe-field="display_name" value="${escapeHtml(probe.display_name)}">
+            </label>
+            <label class="field">
+              <span>Location / note</span>
+              <input type="text" data-probe-key="${escapeHtml(probe.probe_key)}" data-probe-field="location_name" value="${escapeHtml(probe.location_name || "")}">
+            </label>
+            <label class="field">
+              <span>Danger low</span>
+              <input type="number" step="0.1" min="0" max="100" data-probe-key="${escapeHtml(probe.probe_key)}" data-probe-field="danger_low" value="${escapeHtml(probe.rules.danger_low)}">
+            </label>
+            <label class="field">
+              <span>Warn low</span>
+              <input type="number" step="0.1" min="0" max="100" data-probe-key="${escapeHtml(probe.probe_key)}" data-probe-field="warn_low" value="${escapeHtml(probe.rules.warn_low)}">
+            </label>
+            <label class="field">
+              <span>Target low</span>
+              <input type="number" step="0.1" min="0" max="100" data-probe-key="${escapeHtml(probe.probe_key)}" data-probe-field="target_low" value="${escapeHtml(probe.rules.target_low)}">
+            </label>
+            <label class="field">
+              <span>Target high</span>
+              <input type="number" step="0.1" min="0" max="100" data-probe-key="${escapeHtml(probe.probe_key)}" data-probe-field="target_high" value="${escapeHtml(probe.rules.target_high)}">
+            </label>
+            <label class="field">
+              <span>Warn high</span>
+              <input type="number" step="0.1" min="0" max="100" data-probe-key="${escapeHtml(probe.probe_key)}" data-probe-field="warn_high" value="${escapeHtml(probe.rules.warn_high)}">
+            </label>
+            <label class="field">
+              <span>Enabled</span>
+              <select data-probe-key="${escapeHtml(probe.probe_key)}" data-probe-field="enabled">
+                <option value="true" ${probe.enabled ? "selected" : ""}>Visible</option>
+                <option value="false" ${probe.enabled ? "" : "selected"}>Hidden</option>
+              </select>
+            </label>
+          </div>
+        </div>
+      `).join("");
+    }
+
+    function renderProbeCard(station, probe) {
+      const hours = getProbeHours(station.station_id, probe.probe_key, station.default_hours || DEFAULT_HOURS);
+      return `
+        <div class="probe-card ${escapeHtml(stateClass(probe.state))}" data-station-id="${escapeHtml(station.station_id)}" data-probe-key="${escapeHtml(probe.probe_key)}">
+          <div class="probe-head">
+            <div>
+              <h3 class="probe-name">${escapeHtml(probe.display_name)}</h3>
+              <div class="probe-sub">
+                ${escapeHtml(probe.location_name || "No location label yet")} · target ${escapeHtml(fmtRange(probe.rules))}
+              </div>
+            </div>
+            <div class="pill ${escapeHtml(stateClass(probe.state))}">${escapeHtml(probe.state?.text || "No data")}</div>
+          </div>
+
+          <div class="probe-toolbar">
+            <div class="tiny">Latest reading stays active even if this graph window is empty.</div>
+            <div class="range-wrap">
+              <label>Graph range</label>
+              <select class="probe-range">
+                <option value="1" ${hours === 1 ? "selected" : ""}>Last 1 hour</option>
+                <option value="24" ${hours === 24 ? "selected" : ""}>Last 24 hours</option>
+                <option value="168" ${hours === 168 ? "selected" : ""}>Last 7 days</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="metrics">
+            <div class="metric">
+              <div class="metric-label">Current</div>
+              <div class="metric-value">${escapeHtml(fmtPct(probe.current))}</div>
+              <div class="metric-note">Live reading</div>
+            </div>
+            <div class="metric">
+              <div class="metric-label">Average</div>
+              <div class="metric-value js-avg">Loading…</div>
+              <div class="metric-note js-window-label">Window ${escapeHtml(formatWindow(hours))}</div>
+            </div>
+            <div class="metric target-band">
+              <div class="metric-label">Target band</div>
+              <div class="metric-value">${escapeHtml(fmtRange(probe.rules))}</div>
+              <div class="metric-note">Editable in settings</div>
+            </div>
+          </div>
+
+          <div class="plot-box">
+            <img class="probe-plot" alt="Graph for ${escapeHtml(probe.display_name)}">
+          </div>
+
+          <details class="tech">
+            <summary>Technical data</summary>
+            <div class="tech-grid">
+              <div class="tech-item">
+                <div class="tiny">Raw</div>
+                <div><strong>${escapeHtml(fmtRaw(probe.raw))}</strong></div>
+              </div>
+              <div class="tech-item">
+                <div class="tiny">Valid points</div>
+                <div><strong class="js-points">Loading…</strong></div>
+              </div>
+              <div class="tech-item">
+                <div class="tiny">Minimum</div>
+                <div><strong class="js-min">Loading…</strong></div>
+              </div>
+              <div class="tech-item">
+                <div class="tiny">Maximum</div>
+                <div><strong class="js-max">Loading…</strong></div>
+              </div>
+            </div>
+          </details>
+        </div>
+      `;
+    }
+
+    function renderStation(station) {
+      const open = loadExpandedState(station.station_id, station.is_collapsed);
+      const shownProbes = station.probes.filter(p => p.enabled);
+      return `
+        <details class="station" data-station-id="${escapeHtml(station.station_id)}" ${open ? "open" : ""}>
+          <summary>
+            <div class="summary-left">
+              <span class="status-dot ${escapeHtml(station.connectivity.state)}"></span>
+              <div class="summary-text">
+                <div class="station-name">${escapeHtml(station.display_name)}</div>
+                <div class="station-meta">
+                  ${escapeHtml(station.description || "No unit description")} · ${escapeHtml(station.connectivity.label)} · updated ${escapeHtml(station.updated_ago)}
+                </div>
+              </div>
+            </div>
+            <div class="summary-right">
+              <div class="pill ${escapeHtml(stateClass(station.station_state))}">${escapeHtml(station.station_state.text)}</div>
+              <div class="pill count-badge">${shownProbes.length} probes${station.alert_count ? ` · ${station.alert_count} alert${station.alert_count > 1 ? "s" : ""}` : ""}</div>
+            </div>
+          </summary>
+
+          <div class="station-body">
+            <div class="station-info">
+              <div><strong>Station ID:</strong> ${escapeHtml(station.station_id)}</div>
+              <div><strong>Updated:</strong> ${escapeHtml(station.updated_at)}</div>
+            </div>
+
+            <details class="settings section-card">
+              <summary>Edit names and thresholds</summary>
+              <div class="settings-wrap" data-config-station="${escapeHtml(station.station_id)}">
+                <div class="fields">
+                  <label class="field">
+                    <span>Unit name</span>
+                    <input type="text" data-station-field="display_name" value="${escapeHtml(station.display_name)}">
+                  </label>
+                  <label class="field">
+                    <span>Unit description</span>
+                    <input type="text" data-station-field="description" value="${escapeHtml(station.description || "")}">
+                  </label>
+                  <label class="field">
+                    <span>Default graph range</span>
+                    <select data-station-field="default_hours">
+                      <option value="1" ${Number(station.default_hours) === 1 ? "selected" : ""}>Last 1 hour</option>
+                      <option value="24" ${Number(station.default_hours) === 24 ? "selected" : ""}>Last 24 hours</option>
+                      <option value="168" ${Number(station.default_hours) === 168 ? "selected" : ""}>Last 7 days</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span>Collapsed by default</span>
+                    <select data-station-field="is_collapsed">
+                      <option value="false" ${station.is_collapsed ? "" : "selected"}>Expanded</option>
+                      <option value="true" ${station.is_collapsed ? "selected" : ""}>Collapsed</option>
+                    </select>
+                  </label>
+                </div>
+
+                <div class="probe-settings">
+                  ${renderProbeSettings(station)}
+                </div>
+
+                <div class="settings-actions">
+                  <div class="save-msg" data-save-msg="${escapeHtml(station.station_id)}"></div>
+                  <button type="button" data-save-station="${escapeHtml(station.station_id)}">Save settings</button>
+                </div>
+              </div>
+            </details>
+
+            <div class="probe-grid">
+              ${shownProbes.map(probe => renderProbeCard(station, probe)).join("")}
+            </div>
+          </div>
+        </details>
+      `;
+    }
+
+    async function refreshProbeCard(card) {
+      const stationId = card.dataset.stationId;
+      const probeKey = card.dataset.probeKey;
+      const hours = Number(card.querySelector(".probe-range").value || DEFAULT_HOURS);
+      setProbeHours(stationId, probeKey, hours);
+
+      const metrics = await fetch(`/api/probe-metrics/${encodeURIComponent(stationId)}/${encodeURIComponent(probeKey)}?hours=${hours}`);
+      const data = await metrics.json();
+
+      card.querySelector(".js-avg").textContent = data.avg === null ? "—" : fmtPct(data.avg);
+      card.querySelector(".js-window-label").textContent = `Window ${formatWindow(hours)}`;
+      card.querySelector(".js-points").textContent = String(Number(data.points || 0));
+      card.querySelector(".js-min").textContent = data.min === null ? "—" : fmtPct(data.min);
+      card.querySelector(".js-max").textContent = data.max === null ? "—" : fmtPct(data.max);
+
+      const img = card.querySelector(".probe-plot");
+      img.src = `/plot/${encodeURIComponent(stationId)}/${encodeURIComponent(probeKey)}.svg?hours=${hours}&_=${Date.now()}`;
+    }
+
+    function gatherStationPayload(stationId) {
+      const root = document.querySelector(`[data-config-station="${CSS.escape(stationId)}"]`);
+      const station = {};
+      root.querySelectorAll("[data-station-field]").forEach(el => {
+        const field = el.dataset.stationField;
+        let value = el.value;
+        if (field === "default_hours") value = Number(value);
+        if (field === "is_collapsed") value = value === "true";
+        station[field] = value;
+      });
+
+      const probes = {};
+      root.querySelectorAll("[data-probe-key]").forEach(el => {
+        const probeKey = el.dataset.probeKey;
+        const field = el.dataset.probeField;
+        if (!probes[probeKey]) probes[probeKey] = {};
+        let value = el.value;
+        if (["danger_low", "warn_low", "target_low", "target_high", "warn_high"].includes(field)) value = Number(value);
+        if (field === "enabled") value = value === "true";
+        probes[probeKey][field] = value;
+      });
+
+      return { station, probes };
+    }
+
+    async function saveStationConfig(stationId) {
+      const msg = document.querySelector(`[data-save-msg="${CSS.escape(stationId)}"]`);
+      msg.textContent = "Saving…";
+      const payload = gatherStationPayload(stationId);
+
+      const res = await fetch(`/api/config/${encodeURIComponent(stationId)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+
       const data = await res.json();
-
-      if (!data.length) {
-        document.getElementById("content").innerHTML =
-          '<div class="empty">No data received yet.</div>';
+      if (!res.ok) {
+        msg.textContent = data.error || "Save failed";
         return;
       }
 
-      let html = "";
-
-      for (const s of data) {
-        const rules = stationRules(s.station_id);
-        const state = moistureState(s.soil_moisture_pct, rules);
-
-        html += `
-          <div class="station-card">
-            <div class="station-head">
-              <div>
-                <h2 class="station-title">${s.station_id}</h2>
-                <div class="station-sub">
-                  ${rules.label} · target ${rules.target_low}%–${rules.target_high}% · updated ${fmtTimestamp(s.ts)}
-                </div>
-              </div>
-              <div class="pill ${state.cls}">${state.text}</div>
-            </div>
-
-            <div class="stats">
-              <div class="stat ${state.cls}">
-                <div class="label">Current average</div>
-                <div class="value">${fmtPct(s.soil_moisture_pct)}</div>
-                <div class="meter-wrap">
-                  <div class="meter"><span style="width:${barWidth(s.soil_moisture_pct)}"></span></div>
-                </div>
-              </div>
-
-              <div class="stat ${moistureState(s.soil_moisture_1_pct, rules).cls}">
-                <div class="label">Probe 1 now</div>
-                <div class="value">${fmtPct(s.soil_moisture_1_pct)}</div>
-              </div>
-
-              <div class="stat ${moistureState(s.soil_moisture_2_pct, rules).cls}">
-                <div class="label">Probe 2 now</div>
-                <div class="value">${fmtPct(s.soil_moisture_2_pct)}</div>
-              </div>
-
-              <div class="stat">
-                <div class="label">Probe 1 avg (${hours}h)</div>
-                <div class="value">${fmtPct(s.avg_probe1_window)}</div>
-              </div>
-
-              <div class="stat">
-                <div class="label">Probe 2 avg (${hours}h)</div>
-                <div class="value">${fmtPct(s.avg_probe2_window)}</div>
-              </div>
-
-              <div class="stat">
-                <div class="label">Overall avg (${hours}h)</div>
-                <div class="value">${fmtPct(s.avg_station_window)}</div>
-              </div>
-
-              <div class="stat">
-                <div class="label">Raw 1</div>
-                <div class="value small">${fmtRaw(s.soil_raw_1)}</div>
-              </div>
-
-              <div class="stat">
-                <div class="label">Raw 2</div>
-                <div class="value small">${fmtRaw(s.soil_raw_2)}</div>
-              </div>
-
-              <div class="stat">
-                <div class="label">Points in window</div>
-                <div class="value small">${Number(s.window_points || 0)}</div>
-              </div>
-            </div>
-
-            <div class="plot-box">
-              <img src="/plot/${encodeURIComponent(s.station_id)}.svg?hours=${hours}&_=${Date.now()}" alt="Plot for ${s.station_id}">
-            </div>
-          </div>
-        `;
-      }
-
-      document.getElementById("content").innerHTML = html;
+      msg.textContent = "Saved";
+      await loadDashboard();
     }
 
-    document.getElementById("rangeSelect").addEventListener("change", load);
-    load();
-    setInterval(load, 60000);
+    async function attachDynamicHandlers() {
+      document.querySelectorAll(".station").forEach(stationEl => {
+        stationEl.addEventListener("toggle", () => {
+          saveExpandedState(stationEl.dataset.stationId, stationEl.open);
+        });
+      });
+
+      document.querySelectorAll(".probe-range").forEach(select => {
+        select.addEventListener("change", async (event) => {
+          const card = event.target.closest(".probe-card");
+          await refreshProbeCard(card);
+        });
+      });
+
+      document.querySelectorAll("[data-save-station]").forEach(btn => {
+        btn.addEventListener("click", async () => {
+          await saveStationConfig(btn.dataset.saveStation);
+        });
+      });
+
+      for (const card of document.querySelectorAll(".probe-card")) {
+        await refreshProbeCard(card);
+      }
+    }
+
+    async function loadDashboard() {
+      const content = document.getElementById("content");
+      const res = await fetch("/api/dashboard");
+      const stations = await res.json();
+
+      if (!stations.length) {
+        content.className = "empty";
+        content.innerHTML = "No station data received yet.";
+        return;
+      }
+
+      content.className = "";
+      content.innerHTML = stations.map(renderStation).join("");
+      await attachDynamicHandlers();
+    }
+
+    loadDashboard();
+    setInterval(loadDashboard, 60000);
   </script>
 </body>
 </html>
 """
-    html = html.replace("__RULES_JSON__", json.dumps(STATION_RULES))
-    html = html.replace("__DEFAULT_HOURS__", str(DEFAULT_HOURS))
+    html = html.replace("__DEFAULT_HOURS__", json.dumps(DEFAULT_HOURS))
+    html = html.replace("__ALLOWED_WINDOWS__", json.dumps(ALLOWED_WINDOWS))
     return Response(html, mimetype="text/html")
 
 
