@@ -4,10 +4,28 @@ from datetime import datetime, timedelta, timezone
 import io
 import json
 import math
+import time
+from statistics import median
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+
+try:
+    import board
+    import busio
+    import adafruit_ads1x15.ads1115 as ADS
+    from adafruit_ads1x15.analog_in import AnalogIn
+except Exception as exc:
+    board = None
+    busio = None
+    ADS = None
+    AnalogIn = None
+    ADS_IMPORT_ERROR = str(exc)
+else:
+    ADS_IMPORT_ERROR = None
+
 
 DB_PATH = "weather.db"
 app = Flask(__name__)
@@ -41,6 +59,35 @@ PROBES = [
     {"key": "soil_moisture_2_pct", "raw_key": "soil_raw_2", "default_name": "Probe 2"},
 ]
 PROBE_INDEX = {p["key"]: p for p in PROBES}
+
+# ----------------------------
+# pH / ADS1115 settings
+# ----------------------------
+PH_ENABLED = True
+PH_NAME = "Bench pH Probe"
+PH_DESCRIPTION = "Atlas Surveyor live read directly on Raspberry Pi"
+PH_CHANNEL_INDEX = 0          # ADS1115 A0
+PH_ADC_GAIN = 1               # +/- 4.096 V range
+PH_SAMPLES = 9
+PH_SAMPLE_DELAY = 0.03
+PH_LOG_EVERY_SECONDS = 15
+PH_DEFAULT_HOURS = 1
+
+# Atlas Surveyor transfer function:
+# pH = (-5.6548 * voltage) + 15.509
+PH_VOLTS_MIN = 0.265
+PH_VOLTS_MAX = 3.000
+PH_SLOPE = -5.6548
+PH_INTERCEPT = 15.509
+
+# Optional trim after checking with buffers
+PH_CAL_SCALE = 1.0
+PH_CAL_OFFSET = 0.0
+
+_ph_ads = None
+_ph_chan = None
+_ph_error = ADS_IMPORT_ERROR
+_ph_last_logged = None
 
 
 def db():
@@ -203,8 +250,141 @@ def get_probe_configs(conn, station_id):
     return {row["probe_key"]: dict(row) for row in rows}
 
 
+# ----------------------------
+# pH helpers
+# ----------------------------
+def init_ph_hardware():
+    global _ph_ads, _ph_chan, _ph_error
+
+    if not PH_ENABLED:
+        _ph_error = "pH disabled"
+        return
+
+    if _ph_chan is not None:
+        return
+
+    if ADS is None or board is None or busio is None or AnalogIn is None:
+        _ph_error = ADS_IMPORT_ERROR or "ADS1115 libraries not available"
+        return
+
+    try:
+        i2c = busio.I2C(board.SCL, board.SDA)
+        ads = ADS.ADS1115(i2c)
+        ads.gain = PH_ADC_GAIN
+
+        channel_map = {
+            0: ADS.P0,
+            1: ADS.P1,
+            2: ADS.P2,
+            3: ADS.P3,
+        }
+
+        _ph_ads = ads
+        _ph_chan = AnalogIn(ads, channel_map[PH_CHANNEL_INDEX])
+        _ph_error = None
+    except Exception as exc:
+        _ph_ads = None
+        _ph_chan = None
+        _ph_error = str(exc)
+
+
+def surveyor_voltage_to_ph(voltage):
+    raw_ph = (PH_SLOPE * float(voltage)) + PH_INTERCEPT
+    return (raw_ph * PH_CAL_SCALE) + PH_CAL_OFFSET
+
+
+def ph_state_from_reading(voltage, ph_value):
+    if voltage is None or ph_value is None:
+        return {"cls": "nodata", "text": "No valid reading"}
+
+    if voltage < (PH_VOLTS_MIN - 0.10) or voltage > (PH_VOLTS_MAX + 0.10):
+        return {"cls": "warn", "text": "Check probe / wiring"}
+
+    return {"cls": "ok", "text": "Live"}
+
+
+def read_live_ph(samples=PH_SAMPLES, sample_delay=PH_SAMPLE_DELAY):
+    init_ph_hardware()
+
+    if _ph_chan is None:
+        return {
+            "ok": False,
+            "ph": None,
+            "voltage": None,
+            "samples": 0,
+            "error": _ph_error or "ADS1115 unavailable",
+            "state": {"cls": "nodata", "text": "Unavailable"},
+        }
+
+    voltages = []
+    try:
+        for _ in range(max(3, int(samples))):
+            voltages.append(float(_ph_chan.voltage))
+            time.sleep(sample_delay)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "ph": None,
+            "voltage": None,
+            "samples": len(voltages),
+            "error": str(exc),
+            "state": {"cls": "nodata", "text": "Read failed"},
+        }
+
+    if not voltages:
+        return {
+            "ok": False,
+            "ph": None,
+            "voltage": None,
+            "samples": 0,
+            "error": "No ADC samples returned",
+            "state": {"cls": "nodata", "text": "No samples"},
+        }
+
+    voltage = round(median(voltages), 4)
+    ph_value = surveyor_voltage_to_ph(voltage)
+
+    if ph_value < -0.5 or ph_value > 14.5:
+        ph_value = None
+    else:
+        ph_value = round(max(0.0, min(14.0, ph_value)), 2)
+
+    return {
+        "ok": True,
+        "ph": ph_value,
+        "voltage": voltage,
+        "samples": len(voltages),
+        "error": None,
+        "state": ph_state_from_reading(voltage, ph_value),
+    }
+
+
+def maybe_log_ph(ph_data):
+    global _ph_last_logged
+
+    if not ph_data.get("ok") or ph_data.get("ph") is None:
+        return
+
+    now = utc_now()
+    if _ph_last_logged and (now - _ph_last_logged).total_seconds() < PH_LOG_EVERY_SECONDS:
+        return
+
+    ts = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    conn = db()
+    conn.execute("""
+        INSERT INTO ph_readings (ts, ph_voltage, ph_value)
+        VALUES (?, ?, ?)
+    """, (ts, ph_data["voltage"], ph_data["ph"]))
+    conn.commit()
+    conn.close()
+
+    _ph_last_logged = now
+
+
 def init_db():
     conn = db()
+
     conn.execute("""
     CREATE TABLE IF NOT EXISTS readings (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -262,6 +442,21 @@ def init_db():
         UNIQUE(station_id, probe_key)
     )
     """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS ph_readings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        ph_voltage REAL,
+        ph_value REAL
+    )
+    """)
+
+    conn.execute("""
+    CREATE INDEX IF NOT EXISTS idx_ph_readings_ts
+    ON ph_readings(ts)
+    """)
+
     conn.commit()
     conn.close()
 
@@ -478,6 +673,43 @@ def api_save_config(station_id):
     return jsonify({"ok": True})
 
 
+@app.route("/api/ph-live")
+def api_ph_live():
+    data = read_live_ph()
+    if data.get("ok"):
+        maybe_log_ph(data)
+        data["updated_at"] = utc_now_iso()
+    return jsonify(data)
+
+
+@app.route("/api/ph-metrics")
+def api_ph_metrics():
+    hours = clamp_hours(request.args.get("hours", PH_DEFAULT_HOURS, type=int))
+    since = (utc_now() - timedelta(hours=hours)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    conn = db()
+    stats = conn.execute("""
+        SELECT
+            COUNT(ph_value) AS points,
+            AVG(ph_value) AS avg_value,
+            MIN(ph_value) AS min_value,
+            MAX(ph_value) AS max_value,
+            AVG(ph_voltage) AS avg_voltage
+        FROM ph_readings
+        WHERE ts >= ?
+    """, (since,)).fetchone()
+    conn.close()
+
+    return jsonify({
+        "hours": hours,
+        "points": int(stats["points"] or 0),
+        "avg": None if stats["avg_value"] is None else float(stats["avg_value"]),
+        "min": None if stats["min_value"] is None else float(stats["min_value"]),
+        "max": None if stats["max_value"] is None else float(stats["max_value"]),
+        "avg_voltage": None if stats["avg_voltage"] is None else float(stats["avg_voltage"]),
+    })
+
+
 @app.route("/plot/<station_id>/<probe_key>.svg")
 def plot_probe(station_id, probe_key):
     if probe_key not in PROBE_INDEX:
@@ -539,6 +771,63 @@ def plot_probe(station_id, probe_key):
             spine.set_visible(False)
 
     ax.set_title(f"{cfg['display_name']} · last {hours}h")
+    fig.tight_layout()
+
+    buf = io.StringIO()
+    fig.savefig(buf, format="svg", bbox_inches="tight")
+    plt.close(fig)
+    return Response(buf.getvalue(), mimetype="image/svg+xml")
+
+
+@app.route("/plot/ph.svg")
+def plot_ph():
+    hours = clamp_hours(request.args.get("hours", PH_DEFAULT_HOURS, type=int))
+    since = (utc_now() - timedelta(hours=hours)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    conn = db()
+    rows = conn.execute("""
+        SELECT ts, ph_value
+        FROM ph_readings
+        WHERE ts >= ?
+        ORDER BY ts ASC
+    """, (since,)).fetchall()
+    conn.close()
+
+    fig, ax = plt.subplots(figsize=(10, 3.3))
+    values = []
+    times = []
+
+    for row in rows:
+        times.append(parse_iso(row["ts"]))
+        values.append(safe_num(row["ph_value"], math.nan))
+
+    valid_points = sum(0 if math.isnan(v) else 1 for v in values)
+
+    if valid_points:
+        ax.axhline(7.0, linewidth=1.0, alpha=0.25, linestyle="--")
+        ax.plot(times, values, linewidth=2.4)
+        ax.set_ylim(0, 14)
+        ax.set_ylabel("pH")
+        ax.grid(True, alpha=0.28)
+
+        if hours <= 1:
+            locator = mdates.MinuteLocator(interval=10)
+        elif hours <= 24:
+            locator = mdates.HourLocator(interval=2)
+        else:
+            locator = mdates.DayLocator(interval=1)
+
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+    else:
+        ax.text(0.5, 0.54, "No valid pH data in selected window", ha="center", va="center", transform=ax.transAxes)
+        ax.text(0.5, 0.40, "Open the page and let the live logger collect a few samples.", ha="center", va="center", fontsize=9, transform=ax.transAxes)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+    ax.set_title(f"{PH_NAME} · last {hours}h")
     fig.tight_layout()
 
     buf = io.StringIO()
@@ -632,6 +921,10 @@ def home():
       border-radius: var(--radius);
       padding: 24px;
       box-shadow: var(--shadow);
+    }
+
+    #ph-live-slot {
+      margin-bottom: 18px;
     }
 
     .station {
@@ -1024,17 +1317,19 @@ def home():
     <div class="topbar">
       <div>
         <h1>Weather Station Host</h1>
-        <div class="subhead">Auto-refreshes every 60 seconds · each probe has its own graph range</div>
+        <div class="subhead">Station probes refresh every 60 seconds · bench pH is live</div>
       </div>
       <div class="global-note">Tip: open a unit, rename probes, and adjust thresholds live from the settings panel.</div>
     </div>
 
+    <div id="ph-live-slot"></div>
     <div id="content" class="loading">Loading dashboard…</div>
   </div>
 
   <script>
     const DEFAULT_HOURS = __DEFAULT_HOURS__;
     const ALLOWED_WINDOWS = __ALLOWED_WINDOWS__;
+    const PH_DEFAULT_HOURS = __PH_DEFAULT_HOURS__;
 
     function escapeHtml(value) {
       return String(value ?? "")
@@ -1048,6 +1343,16 @@ def home():
     function fmtPct(value) {
       if (value === null || value === undefined || Number.isNaN(Number(value))) return "—";
       return Number(value).toFixed(1) + " %";
+    }
+
+    function fmtPH(value) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return "—";
+      return Number(value).toFixed(2) + " pH";
+    }
+
+    function fmtVoltage(value) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return "—";
+      return Number(value).toFixed(3) + " V";
     }
 
     function fmtRaw(value) {
@@ -1091,6 +1396,16 @@ def home():
 
     function setProbeHours(stationId, probeKey, hours) {
       localStorage.setItem(`probe-hours:${stationId}:${probeKey}`, String(hours));
+    }
+
+    function getPhHours() {
+      const saved = Number(localStorage.getItem("ph-hours"));
+      if (ALLOWED_WINDOWS.includes(saved)) return saved;
+      return PH_DEFAULT_HOURS;
+    }
+
+    function setPhHours(hours) {
+      localStorage.setItem("ph-hours", String(hours));
     }
 
     function renderProbeSettings(station) {
@@ -1286,6 +1601,79 @@ def home():
       `;
     }
 
+    function renderPhPanel() {
+      const hours = getPhHours();
+
+      return `
+        <div class="probe-card nodata" id="ph-card">
+          <div class="probe-head">
+            <div>
+              <h3 class="probe-name">${escapeHtml("Bench pH Probe")}</h3>
+              <div class="probe-sub">${escapeHtml("Atlas Surveyor live read from Raspberry Pi")}</div>
+            </div>
+            <div class="pill nodata js-ph-state">Starting…</div>
+          </div>
+
+          <div class="probe-toolbar">
+            <div class="tiny js-ph-updated">Waiting for first live sample…</div>
+            <div class="range-wrap">
+              <label>Graph range</label>
+              <select id="ph-range">
+                <option value="1" ${hours === 1 ? "selected" : ""}>Last 1 hour</option>
+                <option value="24" ${hours === 24 ? "selected" : ""}>Last 24 hours</option>
+                <option value="168" ${hours === 168 ? "selected" : ""}>Last 7 days</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="metrics">
+            <div class="metric">
+              <div class="metric-label">Current</div>
+              <div class="metric-value js-ph-current">Loading…</div>
+              <div class="metric-note js-ph-voltage">Voltage —</div>
+            </div>
+            <div class="metric">
+              <div class="metric-label">Average</div>
+              <div class="metric-value js-ph-avg">Loading…</div>
+              <div class="metric-note js-ph-window">Window ${formatWindow(hours)}</div>
+            </div>
+            <div class="metric target-band">
+              <div class="metric-label">Mode</div>
+              <div class="metric-value">Live</div>
+              <div class="metric-note">Direct Pi read</div>
+            </div>
+          </div>
+
+          <div class="plot-box">
+            <img id="ph-plot" alt="Graph for bench pH probe">
+          </div>
+
+          <details class="tech">
+            <summary>Technical data</summary>
+            <div class="tech-grid">
+              <div class="tech-item">
+                <div class="tiny">Samples / read</div>
+                <div><strong class="js-ph-samples">—</strong></div>
+              </div>
+              <div class="tech-item">
+                <div class="tiny">Valid points</div>
+                <div><strong class="js-ph-points">—</strong></div>
+              </div>
+              <div class="tech-item">
+                <div class="tiny">Minimum</div>
+                <div><strong class="js-ph-min">—</strong></div>
+              </div>
+              <div class="tech-item">
+                <div class="tiny">Maximum</div>
+                <div><strong class="js-ph-max">—</strong></div>
+              </div>
+            </div>
+            <div class="tiny js-ph-error" style="margin-top:8px;"></div>
+          </details>
+        </div>
+      `;
+    }
+
     async function refreshProbeCard(card) {
       const stationId = card.dataset.stationId;
       const probeKey = card.dataset.probeKey;
@@ -1351,6 +1739,55 @@ def home():
       await loadDashboard();
     }
 
+    function mountPhPanel() {
+      const slot = document.getElementById("ph-live-slot");
+      if (!slot) return;
+
+      slot.innerHTML = renderPhPanel();
+
+      document.getElementById("ph-range").addEventListener("change", async (event) => {
+        setPhHours(Number(event.target.value));
+        await refreshPhPanel(true);
+      });
+    }
+
+    async function refreshPhPanel(full = false) {
+      const card = document.getElementById("ph-card");
+      if (!card) return;
+
+      const liveRes = await fetch("/api/ph-live");
+      const live = await liveRes.json();
+
+      const cls = stateClass(live.state);
+      card.classList.remove("ok", "warn", "bad", "nodata");
+      card.classList.add(cls);
+
+      const pill = card.querySelector(".js-ph-state");
+      pill.className = `pill ${cls} js-ph-state`;
+      pill.textContent = live.state?.text || "Unavailable";
+
+      card.querySelector(".js-ph-current").textContent = fmtPH(live.ph);
+      card.querySelector(".js-ph-voltage").textContent = live.voltage === null ? "Voltage —" : `Voltage ${fmtVoltage(live.voltage)}`;
+      card.querySelector(".js-ph-samples").textContent = String(Number(live.samples || 0));
+      card.querySelector(".js-ph-updated").textContent = live.ok ? "Live ADS1115 read" : "Live read unavailable";
+      card.querySelector(".js-ph-error").textContent = live.error ? `Reader error: ${live.error}` : "";
+
+      if (!full) return;
+
+      const hours = getPhHours();
+      const metricsRes = await fetch(`/api/ph-metrics?hours=${hours}`);
+      const metrics = await metricsRes.json();
+
+      card.querySelector(".js-ph-avg").textContent = metrics.avg === null ? "—" : fmtPH(metrics.avg);
+      card.querySelector(".js-ph-window").textContent = `Window ${formatWindow(hours)}`;
+      card.querySelector(".js-ph-points").textContent = String(Number(metrics.points || 0));
+      card.querySelector(".js-ph-min").textContent = metrics.min === null ? "—" : fmtPH(metrics.min);
+      card.querySelector(".js-ph-max").textContent = metrics.max === null ? "—" : fmtPH(metrics.max);
+
+      const plot = document.getElementById("ph-plot");
+      plot.src = `/plot/ph.svg?hours=${hours}&_=${Date.now()}`;
+    }
+
     async function attachDynamicHandlers() {
       document.querySelectorAll(".station").forEach(stationEl => {
         stationEl.addEventListener("toggle", () => {
@@ -1371,7 +1808,7 @@ def home():
         });
       });
 
-      for (const card of document.querySelectorAll(".probe-card")) {
+      for (const card of document.querySelectorAll(".probe-card[data-station-id]")) {
         await refreshProbeCard(card);
       }
     }
@@ -1392,17 +1829,24 @@ def home():
       await attachDynamicHandlers();
     }
 
+    mountPhPanel();
+    refreshPhPanel(true);
     loadDashboard();
+
     setInterval(loadDashboard, 60000);
+    setInterval(() => refreshPhPanel(false), 5000);
+    setInterval(() => refreshPhPanel(true), 30000);
   </script>
 </body>
 </html>
 """
     html = html.replace("__DEFAULT_HOURS__", json.dumps(DEFAULT_HOURS))
     html = html.replace("__ALLOWED_WINDOWS__", json.dumps(ALLOWED_WINDOWS))
+    html = html.replace("__PH_DEFAULT_HOURS__", json.dumps(PH_DEFAULT_HOURS))
     return Response(html, mimetype="text/html")
 
 
 if __name__ == "__main__":
     init_db()
+    init_ph_hardware()
     app.run(host="0.0.0.0", port=5000, debug=False)
