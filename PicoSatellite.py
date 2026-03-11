@@ -1,3 +1,4 @@
+
 from flask import Flask, request, jsonify, Response
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -26,6 +27,15 @@ except Exception as exc:
     ADS_IMPORT_ERROR = str(exc)
 else:
     ADS_IMPORT_ERROR = None
+
+try:
+    from smbus2 import SMBus, i2c_msg
+except Exception as exc:
+    SMBus = None
+    i2c_msg = None
+    ATLAS_I2C_IMPORT_ERROR = str(exc)
+else:
+    ATLAS_I2C_IMPORT_ERROR = None
 
 
 DB_PATH = "weather.db"
@@ -62,8 +72,10 @@ PROBES = [
 PROBE_INDEX = {p["key"]: p for p in PROBES}
 
 # ----------------------------
-# pH / ADS1115 settings
+# Bench sensor settings
 # ----------------------------
+BENCH_POLL_SECONDS = 5
+
 PH_ENABLED = True
 PH_NAME = "Bench pH Probe"
 PH_DESCRIPTION = "Atlas Surveyor live read directly on Raspberry Pi"
@@ -73,7 +85,7 @@ PH_SAMPLES = 9
 PH_SAMPLE_DELAY = 0.03
 PH_LOG_EVERY_SECONDS = 15
 PH_DEFAULT_HOURS = 24
-PH_RECENT_LIMIT = 10
+PH_RECENT_LIMIT = 25
 PH_CHANGE_EPSILON = 0.02
 
 # Atlas Surveyor transfer function:
@@ -87,16 +99,53 @@ PH_INTERCEPT = 15.509
 PH_CAL_SCALE = 1.0
 PH_CAL_OFFSET = 0.0
 
+TEMP_ENABLED = True
+TEMP_NAME = "Bench Temperature Probe"
+TEMP_DESCRIPTION = "Atlas EZO RTD on non-isolated carrier board"
+TEMP_I2C_ADDR = 0x66
+TEMP_I2C_BUS = 1
+TEMP_READ_DELAY = 1.0
+TEMP_LOG_EVERY_SECONDS = 15
+TEMP_DEFAULT_HOURS = 24
+TEMP_RECENT_LIMIT = 25
+TEMP_CHANGE_EPSILON = 0.05
+
+_ph_i2c = None
 _ph_ads = None
 _ph_chan = None
 _ph_error = ADS_IMPORT_ERROR
 _ph_last_logged = None
-_ph_thread = None
-_ph_stop = threading.Event()
+
+_temp_bus = None
+_temp_error = ATLAS_I2C_IMPORT_ERROR
+_temp_last_logged = None
+
+_bench_lock = threading.Lock()
+_bench_thread = None
+_bench_stop = threading.Event()
+
+_ph_last_live = {
+    "ok": False,
+    "ph": None,
+    "voltage": None,
+    "samples": 0,
+    "error": "Starting",
+    "state": {"cls": "nodata", "text": "Starting…"},
+    "updated_at": None,
+}
+
+_temp_last_live = {
+    "ok": False,
+    "temp_c": None,
+    "samples": 0,
+    "error": "Starting",
+    "state": {"cls": "nodata", "text": "Starting…"},
+    "updated_at": None,
+}
 
 
 def db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -256,7 +305,7 @@ def get_probe_configs(conn, station_id):
 
 
 # ----------------------------
-# pH helpers
+# Bench helpers
 # ----------------------------
 def surveyor_voltage_to_ph(voltage):
     raw_ph = (PH_SLOPE * float(voltage)) + PH_INTERCEPT
@@ -273,11 +322,13 @@ def ph_state_from_reading(voltage, ph_value):
     return {"cls": "ok", "text": "Live"}
 
 
+def temp_state_from_reading(temp_c):
+    if temp_c is None:
+        return {"cls": "nodata", "text": "No valid reading"}
+    return {"cls": "ok", "text": "Live"}
+
+
 def build_ads_channel(ads):
-    """
-    Tries both the newer constant style (ADS.P0) and a raw integer fallback.
-    Your error shows some installs do not expose ADS.P0.
-    """
     names = {0: "P0", 1: "P1", 2: "P2", 3: "P3"}
     channel_name = names.get(PH_CHANNEL_INDEX)
 
@@ -287,12 +338,41 @@ def build_ads_channel(ads):
         except Exception:
             pass
 
-    # Fallback for installs that accept numeric channel ids
     return AnalogIn(ads, PH_CHANNEL_INDEX)
 
 
+def reset_ph_hardware(reason=None):
+    global _ph_i2c, _ph_ads, _ph_chan, _ph_error
+    try:
+        if _ph_i2c is not None:
+            try:
+                _ph_i2c.deinit()
+            except Exception:
+                pass
+    finally:
+        _ph_i2c = None
+        _ph_ads = None
+        _ph_chan = None
+        if reason:
+            _ph_error = str(reason)
+
+
+def reset_temp_hardware(reason=None):
+    global _temp_bus, _temp_error
+    try:
+        if _temp_bus is not None:
+            try:
+                _temp_bus.close()
+            except Exception:
+                pass
+    finally:
+        _temp_bus = None
+        if reason:
+            _temp_error = str(reason)
+
+
 def init_ph_hardware():
-    global _ph_ads, _ph_chan, _ph_error
+    global _ph_i2c, _ph_ads, _ph_chan, _ph_error
 
     if not PH_ENABLED:
         _ph_error = "pH disabled"
@@ -307,19 +387,78 @@ def init_ph_hardware():
 
     try:
         i2c = busio.I2C(board.SCL, board.SDA)
+
+        deadline = time.monotonic() + 2.0
+        while not i2c.try_lock():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Could not lock I2C bus for ADS1115")
+            time.sleep(0.01)
+        i2c.unlock()
+
         ads = ADS.ADS1115(i2c)
         ads.gain = PH_ADC_GAIN
 
+        _ph_i2c = i2c
         _ph_ads = ads
         _ph_chan = build_ads_channel(ads)
         _ph_error = None
     except Exception as exc:
-        _ph_ads = None
-        _ph_chan = None
-        _ph_error = str(exc)
+        reset_ph_hardware(exc)
 
 
-def read_live_ph(samples=PH_SAMPLES, sample_delay=PH_SAMPLE_DELAY):
+def init_temp_hardware():
+    global _temp_bus, _temp_error
+
+    if not TEMP_ENABLED:
+        _temp_error = "Temperature disabled"
+        return
+
+    if _temp_bus is not None:
+        return
+
+    if SMBus is None or i2c_msg is None:
+        _temp_error = ATLAS_I2C_IMPORT_ERROR or "smbus2 not available"
+        return
+
+    try:
+        _temp_bus = SMBus(TEMP_I2C_BUS)
+        _temp_error = None
+    except Exception as exc:
+        reset_temp_hardware(exc)
+
+
+def ezo_query(address, command="R", wait_s=1.0, read_bytes=32):
+    init_temp_hardware()
+
+    if _temp_bus is None:
+        raise RuntimeError(_temp_error or "EZO RTD unavailable")
+
+    _temp_bus.i2c_rdwr(i2c_msg.write(address, command.encode("ascii")))
+    time.sleep(wait_s)
+
+    read = i2c_msg.read(address, read_bytes)
+    _temp_bus.i2c_rdwr(read)
+    payload = bytes(read)
+
+    if not payload:
+        raise RuntimeError("No response from EZO circuit")
+
+    code = payload[0]
+    text = payload[1:].split(b"\x00", 1)[0].decode("ascii", errors="ignore").strip()
+
+    if code == 1:
+        return text
+    if code == 254:
+        raise RuntimeError("RTD still processing")
+    if code == 255:
+        raise RuntimeError("RTD has no data")
+    if code == 2:
+        raise RuntimeError("RTD syntax error")
+
+    raise RuntimeError(f"RTD response code {code}: {text}")
+
+
+def read_live_ph_hw(samples=PH_SAMPLES, sample_delay=PH_SAMPLE_DELAY):
     init_ph_hardware()
 
     if _ph_chan is None:
@@ -334,10 +473,12 @@ def read_live_ph(samples=PH_SAMPLES, sample_delay=PH_SAMPLE_DELAY):
 
     voltages = []
     try:
-        for _ in range(max(3, int(samples))):
-            voltages.append(float(_ph_chan.voltage))
-            time.sleep(sample_delay)
+        with _bench_lock:
+            for _ in range(max(3, int(samples))):
+                voltages.append(float(_ph_chan.voltage))
+                time.sleep(sample_delay)
     except Exception as exc:
+        reset_ph_hardware(exc)
         return {
             "ok": False,
             "ph": None,
@@ -375,6 +516,29 @@ def read_live_ph(samples=PH_SAMPLES, sample_delay=PH_SAMPLE_DELAY):
     }
 
 
+def read_live_temp_hw():
+    try:
+        with _bench_lock:
+            text = ezo_query(TEMP_I2C_ADDR, "R", TEMP_READ_DELAY, 32)
+        temp_c = round(float(text), 2)
+        return {
+            "ok": True,
+            "temp_c": temp_c,
+            "samples": 1,
+            "error": None,
+            "state": temp_state_from_reading(temp_c),
+        }
+    except Exception as exc:
+        reset_temp_hardware(exc)
+        return {
+            "ok": False,
+            "temp_c": None,
+            "samples": 0,
+            "error": str(exc),
+            "state": {"cls": "nodata", "text": "Unavailable"},
+        }
+
+
 def maybe_log_ph(ph_data):
     global _ph_last_logged
 
@@ -398,31 +562,89 @@ def maybe_log_ph(ph_data):
     _ph_last_logged = now
 
 
-def ph_logger_loop():
-    while not _ph_stop.is_set():
+def maybe_log_temp(temp_data):
+    global _temp_last_logged
+
+    if not temp_data.get("ok") or temp_data.get("temp_c") is None:
+        return
+
+    now = utc_now()
+    if _temp_last_logged and (now - _temp_last_logged).total_seconds() < TEMP_LOG_EVERY_SECONDS:
+        return
+
+    ts = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    conn = db()
+    conn.execute("""
+        INSERT INTO temp_readings (ts, temp_c)
+        VALUES (?, ?)
+    """, (ts, temp_data["temp_c"]))
+    conn.commit()
+    conn.close()
+
+    _temp_last_logged = now
+
+
+def bench_logger_loop():
+    global _ph_last_live, _temp_last_live
+
+    while not _bench_stop.is_set():
+        now_iso = utc_now_iso()
+
         try:
-            data = read_live_ph()
-            if data.get("ok"):
-                maybe_log_ph(data)
+            ph_data = read_live_ph_hw()
+            ph_data["updated_at"] = now_iso if ph_data.get("ok") else _ph_last_live.get("updated_at")
+            _ph_last_live = ph_data
+            if ph_data.get("ok"):
+                maybe_log_ph(ph_data)
         except Exception as exc:
-            print("pH logger error:", exc, flush=True)
+            _ph_last_live = {
+                "ok": False,
+                "ph": None,
+                "voltage": None,
+                "samples": 0,
+                "error": str(exc),
+                "state": {"cls": "nodata", "text": "Unavailable"},
+                "updated_at": _ph_last_live.get("updated_at"),
+            }
 
-        _ph_stop.wait(PH_LOG_EVERY_SECONDS)
+        try:
+            temp_data = read_live_temp_hw()
+            temp_data["updated_at"] = now_iso if temp_data.get("ok") else _temp_last_live.get("updated_at")
+            _temp_last_live = temp_data
+            if temp_data.get("ok"):
+                maybe_log_temp(temp_data)
+        except Exception as exc:
+            _temp_last_live = {
+                "ok": False,
+                "temp_c": None,
+                "samples": 0,
+                "error": str(exc),
+                "state": {"cls": "nodata", "text": "Unavailable"},
+                "updated_at": _temp_last_live.get("updated_at"),
+            }
+
+        _bench_stop.wait(BENCH_POLL_SECONDS)
 
 
-def start_ph_logger():
-    global _ph_thread
-    if not PH_ENABLED:
+def start_bench_logger():
+    global _bench_thread
+
+    if _bench_thread and _bench_thread.is_alive():
         return
-    if _ph_thread and _ph_thread.is_alive():
-        return
 
-    _ph_thread = threading.Thread(target=ph_logger_loop, name="ph-logger", daemon=True)
-    _ph_thread.start()
+    _bench_thread = threading.Thread(
+        target=bench_logger_loop,
+        name="bench-logger",
+        daemon=True
+    )
+    _bench_thread.start()
 
 
 def init_db():
     conn = db()
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
 
     conn.execute("""
     CREATE TABLE IF NOT EXISTS readings (
@@ -494,6 +716,19 @@ def init_db():
     conn.execute("""
     CREATE INDEX IF NOT EXISTS idx_ph_readings_ts
     ON ph_readings(ts)
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS temp_readings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        temp_c REAL
+    )
+    """)
+
+    conn.execute("""
+    CREATE INDEX IF NOT EXISTS idx_temp_readings_ts
+    ON temp_readings(ts)
     """)
 
     conn.commit()
@@ -714,11 +949,7 @@ def api_save_config(station_id):
 
 @app.route("/api/ph-live")
 def api_ph_live():
-    data = read_live_ph()
-    if data.get("ok"):
-        maybe_log_ph(data)
-        data["updated_at"] = utc_now_iso()
-    return jsonify(data)
+    return jsonify(_ph_last_live)
 
 
 @app.route("/api/ph-metrics")
@@ -753,7 +984,7 @@ def api_ph_metrics():
 
 @app.route("/api/ph-recent")
 def api_ph_recent():
-    limit = max(1, min(50, request.args.get("limit", PH_RECENT_LIMIT, type=int)))
+    limit = max(1, min(100, request.args.get("limit", PH_RECENT_LIMIT, type=int)))
 
     conn = db()
     rows = conn.execute("""
@@ -785,6 +1016,189 @@ def api_ph_recent():
             break
 
     return jsonify(recent)
+
+
+@app.route("/api/ph-reset", methods=["POST"])
+def api_ph_reset():
+    global _ph_last_logged
+    conn = db()
+    conn.execute("DELETE FROM ph_readings")
+    conn.commit()
+    conn.close()
+    _ph_last_logged = None
+    return jsonify({"ok": True})
+
+
+@app.route("/api/temp-live")
+def api_temp_live():
+    return jsonify(_temp_last_live)
+
+
+@app.route("/api/temp-metrics")
+def api_temp_metrics():
+    hours = clamp_hours(request.args.get("hours", TEMP_DEFAULT_HOURS, type=int))
+    since = (utc_now() - timedelta(hours=hours)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    conn = db()
+    stats = conn.execute("""
+        SELECT
+            COUNT(temp_c) AS points,
+            AVG(temp_c) AS avg_value,
+            MIN(temp_c) AS min_value,
+            MAX(temp_c) AS max_value,
+            MAX(ts) AS last_ts
+        FROM temp_readings
+        WHERE ts >= ?
+    """, (since,)).fetchone()
+    conn.close()
+
+    return jsonify({
+        "hours": hours,
+        "points": int(stats["points"] or 0),
+        "avg": None if stats["avg_value"] is None else float(stats["avg_value"]),
+        "min": None if stats["min_value"] is None else float(stats["min_value"]),
+        "max": None if stats["max_value"] is None else float(stats["max_value"]),
+        "last_ts": stats["last_ts"],
+    })
+
+
+@app.route("/api/temp-recent")
+def api_temp_recent():
+    limit = max(1, min(100, request.args.get("limit", TEMP_RECENT_LIMIT, type=int)))
+
+    conn = db()
+    rows = conn.execute("""
+        SELECT ts, temp_c
+        FROM temp_readings
+        WHERE temp_c IS NOT NULL
+        ORDER BY ts DESC
+        LIMIT 250
+    """).fetchall()
+    conn.close()
+
+    recent = []
+    last_value = None
+
+    for row in rows:
+        val = safe_num(row["temp_c"], math.nan)
+        if not math.isfinite(val):
+            continue
+
+        if last_value is None or abs(val - last_value) >= TEMP_CHANGE_EPSILON:
+            recent.append({
+                "ts": row["ts"],
+                "temp_c": round(val, 2),
+            })
+            last_value = val
+
+        if len(recent) >= limit:
+            break
+
+    return jsonify(recent)
+
+
+@app.route("/api/temp-reset", methods=["POST"])
+def api_temp_reset():
+    global _temp_last_logged
+    conn = db()
+    conn.execute("DELETE FROM temp_readings")
+    conn.commit()
+    conn.close()
+    _temp_last_logged = None
+    return jsonify({"ok": True})
+
+
+def render_series_plot(rows, parse_value, title, y_label, hours, y_min=None, y_max=None):
+    fig, ax = plt.subplots(figsize=(10, 3.3))
+
+    times = []
+    values = []
+
+    for row in rows:
+        times.append(parse_iso(row["ts"]))
+        values.append(parse_value(row))
+
+    plot_values = [math.nan if v is None else v for v in values]
+    valid_points = sum(0 if math.isnan(v) else 1 for v in plot_values)
+
+    if valid_points:
+        ax.plot(times, plot_values, linewidth=2.4)
+        if y_min is not None or y_max is not None:
+            ax.set_ylim(y_min, y_max)
+        ax.set_ylabel(y_label)
+        ax.grid(True, alpha=0.28)
+
+        if hours <= 1:
+            locator = mdates.MinuteLocator(interval=10)
+        elif hours <= 24:
+            locator = mdates.HourLocator(interval=2)
+        else:
+            locator = mdates.DayLocator(interval=1)
+
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+    else:
+        ax.text(0.5, 0.54, "No valid data in selected window", ha="center", va="center", transform=ax.transAxes)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+    ax.set_title(f"{title} · last {hours}h")
+    fig.tight_layout()
+
+    buf = io.StringIO()
+    fig.savefig(buf, format="svg", bbox_inches="tight")
+    plt.close(fig)
+    return Response(buf.getvalue(), mimetype="image/svg+xml")
+
+
+@app.route("/plot/ph.svg")
+def plot_ph():
+    hours = clamp_hours(request.args.get("hours", PH_DEFAULT_HOURS, type=int))
+    since = (utc_now() - timedelta(hours=hours)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    conn = db()
+    rows = conn.execute("""
+        SELECT ts, ph_value, ph_voltage
+        FROM ph_readings
+        WHERE ts >= ?
+        ORDER BY ts ASC
+    """, (since,)).fetchall()
+    conn.close()
+
+    return render_series_plot(
+        rows=rows,
+        parse_value=lambda row: None if row["ph_value"] is None else float(row["ph_value"]),
+        title="Bench pH Probe",
+        y_label="pH",
+        hours=hours,
+        y_min=0,
+        y_max=14,
+    )
+
+
+@app.route("/plot/temp.svg")
+def plot_temp():
+    hours = clamp_hours(request.args.get("hours", TEMP_DEFAULT_HOURS, type=int))
+    since = (utc_now() - timedelta(hours=hours)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    conn = db()
+    rows = conn.execute("""
+        SELECT ts, temp_c
+        FROM temp_readings
+        WHERE ts >= ?
+        ORDER BY ts ASC
+    """, (since,)).fetchall()
+    conn.close()
+
+    return render_series_plot(
+        rows=rows,
+        parse_value=lambda row: None if row["temp_c"] is None else float(row["temp_c"]),
+        title="Bench Temperature Probe",
+        y_label="°C",
+        hours=hours,
+    )
 
 
 @app.route("/plot/<station_id>/<probe_key>.svg")
@@ -1145,6 +1559,7 @@ def home():
     .save-msg {
       color: var(--muted);
       font-size: 0.92rem;
+      min-height: 1.2em;
     }
 
     button {
@@ -1366,7 +1781,7 @@ def home():
     <div class="topbar">
       <div>
         <h1>Sensor Host</h1>
-        <div class="subhead">Field stations refresh every 60 seconds · bench pH refreshes live</div>
+        <div class="subhead">Field stations refresh every 60 seconds · bench pH and temperature refresh from cached live reads</div>
       </div>
       <div class="global-note">Tip: open a unit, rename probes, adjust thresholds, and keep the bench module collapsed when you are outside.</div>
     </div>
@@ -1402,6 +1817,11 @@ def home():
     function fmtVoltage(value) {
       if (value === null || value === undefined || Number.isNaN(Number(value))) return "—";
       return Number(value).toFixed(3) + " V";
+    }
+
+    function fmtTemp(value) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return "—";
+      return Number(value).toFixed(2) + " °C";
     }
 
     function fmtRaw(value) {
@@ -1458,14 +1878,15 @@ def home():
       localStorage.setItem(`probe-hours:${stationId}:${probeKey}`, String(hours));
     }
 
-    function getPhHours() {
-      const saved = Number(localStorage.getItem("ph-hours"));
+    function getBenchHours(kind, fallback = 24) {
+      const key = `bench-hours:${kind}`;
+      const saved = Number(localStorage.getItem(key));
       if (ALLOWED_WINDOWS.includes(saved)) return saved;
-      return PH_DEFAULT_HOURS;
+      return fallback;
     }
 
-    function setPhHours(hours) {
-      localStorage.setItem("ph-hours", String(hours));
+    function setBenchHours(kind, hours) {
+      localStorage.setItem(`bench-hours:${kind}`, String(hours));
     }
 
     function renderProbeSettings(station) {
@@ -1661,111 +2082,6 @@ def home():
       `;
     }
 
-    function renderBenchPanel() {
-      const hours = getPhHours();
-      const open = loadExpandedState("bench_ph", false);
-
-      return `
-        <details class="station" data-station-id="bench_ph" ${open ? "open" : ""}>
-          <summary>
-            <div class="summary-left">
-              <span class="status-dot offline js-ph-dot"></span>
-              <div class="summary-text">
-                <div class="station-name">${escapeHtml("Bench pH Probe")}</div>
-                <div class="station-meta js-ph-meta">${escapeHtml("Atlas Surveyor direct read via ADS1115 · waiting for first sample")}</div>
-              </div>
-            </div>
-            <div class="summary-right">
-              <div class="pill nodata js-ph-state">Starting…</div>
-              <div class="pill count-badge">Bench module</div>
-            </div>
-          </summary>
-
-          <div class="station-body">
-            <div class="station-info">
-              <div><strong>Module:</strong> Bench pH</div>
-              <div><strong>Last updated:</strong> <span class="js-ph-last-ts">—</span></div>
-            </div>
-
-            <div class="probe-grid" style="grid-template-columns: 1fr;">
-              <div class="probe-card nodata" id="ph-card">
-                <div class="probe-head">
-                  <div>
-                    <h3 class="probe-name">${escapeHtml("Bench pH Probe")}</h3>
-                    <div class="probe-sub">${escapeHtml("Bench-side pH logging on Raspberry Pi")}</div>
-                  </div>
-                  <div class="pill nodata js-ph-state-inner">Starting…</div>
-                </div>
-
-                <div class="probe-toolbar">
-                  <div class="tiny js-ph-updated">Waiting for first live sample…</div>
-                  <div class="range-wrap">
-                    <label>Window</label>
-                    <select id="ph-range">
-                      <option value="1" ${hours === 1 ? "selected" : ""}>Last 1 hour</option>
-                      <option value="24" ${hours === 24 ? "selected" : ""}>Last 24 hours</option>
-                      <option value="168" ${hours === 168 ? "selected" : ""}>Last 7 days</option>
-                    </select>
-                  </div>
-                </div>
-
-                <div class="metrics two">
-                  <div class="metric">
-                    <div class="metric-label">Current</div>
-                    <div class="metric-value js-ph-current">Loading…</div>
-                    <div class="metric-note js-ph-voltage">Voltage —</div>
-                  </div>
-                  <div class="metric">
-                    <div class="metric-label">Average</div>
-                    <div class="metric-value js-ph-avg">Loading…</div>
-                    <div class="metric-note js-ph-window">Window ${formatWindow(hours)}</div>
-                  </div>
-                </div>
-
-                <div class="section-card">
-                  <div class="metric-label" style="margin-bottom:10px;">Last 10 changed readings</div>
-                  <div class="recent-empty js-ph-recent-empty">Loading…</div>
-                  <table class="recent-table js-ph-recent-table" hidden>
-                    <thead>
-                      <tr>
-                        <th>Time</th>
-                        <th>pH</th>
-                        <th>Voltage</th>
-                      </tr>
-                    </thead>
-                    <tbody class="js-ph-recent-body"></tbody>
-                  </table>
-                </div>
-
-                <details class="tech">
-                  <summary>Technical data</summary>
-                  <div class="tech-grid">
-                    <div class="tech-item">
-                      <div class="tiny">Samples / read</div>
-                      <div><strong class="js-ph-samples">—</strong></div>
-                    </div>
-                    <div class="tech-item">
-                      <div class="tiny">Valid points</div>
-                      <div><strong class="js-ph-points">—</strong></div>
-                    </div>
-                    <div class="tech-item">
-                      <div class="tiny">Minimum</div>
-                      <div><strong class="js-ph-min">—</strong></div>
-                    </div>
-                    <div class="tech-item">
-                      <div class="tiny">Maximum</div>
-                      <div><strong class="js-ph-max">—</strong></div>
-                    </div>
-                  </div>
-                  <div class="tiny js-ph-error" style="margin-top:8px;"></div>
-                </details>
-              </div>
-            </div>
-          </div>
-        </details>
-      `;
-    }
-
     async function refreshProbeCard(card) {
       const stationId = card.dataset.stationId;
       const probeKey = card.dataset.probeKey;
@@ -1831,102 +2147,322 @@ def home():
       await loadDashboard();
     }
 
-    function mountBenchPanel() {
-      const slot = document.getElementById("bench-slot");
-      if (!slot) return;
+    async function safeFetchJson(url, timeoutMs = 5000, fetchOptions = {}) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-      slot.innerHTML = renderBenchPanel();
-
-      const range = document.getElementById("ph-range");
-      if (range) {
-        range.addEventListener("change", async (event) => {
-          setPhHours(Number(event.target.value));
-          await refreshPhPanel(true);
+      try {
+        const res = await fetch(url, {
+          cache: "no-store",
+          ...fetchOptions,
+          signal: controller.signal
         });
+
+        const text = await res.text();
+        const data = text ? JSON.parse(text) : {};
+
+        if (!res.ok) {
+          throw new Error(data.error || `HTTP ${res.status}`);
+        }
+        return data;
+      } finally {
+        clearTimeout(timer);
       }
-
-      document.querySelectorAll('.station[data-station-id="bench_ph"]').forEach(stationEl => {
-        stationEl.addEventListener("toggle", () => {
-          saveExpandedState("bench_ph", stationEl.open);
-        });
-      });
     }
 
-    async function refreshPhPanel(full = false) {
-      const card = document.getElementById("ph-card");
+    function renderBenchCard(kind, title, subtitle) {
+      const hours = getBenchHours(kind, 24);
+
+      return `
+        <div class="probe-card nodata js-bench-card" data-kind="${escapeHtml(kind)}">
+          <div class="probe-head">
+            <div>
+              <div style="display:flex;align-items:center;gap:10px;">
+                <span class="status-dot offline js-bench-dot" data-kind="${escapeHtml(kind)}"></span>
+                <h3 class="probe-name" style="margin:0;">${escapeHtml(title)}</h3>
+              </div>
+              <div class="probe-sub" style="margin-top:6px;">${escapeHtml(subtitle)}</div>
+            </div>
+            <div class="pill nodata js-bench-state" data-kind="${escapeHtml(kind)}">Starting…</div>
+          </div>
+
+          <div class="probe-toolbar">
+            <div class="tiny js-bench-updated" data-kind="${escapeHtml(kind)}">Waiting for first sample…</div>
+            <div class="range-wrap">
+              <label>Window</label>
+              <select class="js-bench-range" data-kind="${escapeHtml(kind)}">
+                <option value="1" ${hours === 1 ? "selected" : ""}>Last 1 hour</option>
+                <option value="24" ${hours === 24 ? "selected" : ""}>Last 24 hours</option>
+                <option value="168" ${hours === 168 ? "selected" : ""}>Last 7 days</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="metrics two">
+            <div class="metric">
+              <div class="metric-label">Current</div>
+              <div class="metric-value js-bench-current" data-kind="${escapeHtml(kind)}">Loading…</div>
+              <div class="metric-note js-bench-secondary" data-kind="${escapeHtml(kind)}">—</div>
+            </div>
+            <div class="metric">
+              <div class="metric-label">Average</div>
+              <div class="metric-value js-bench-avg" data-kind="${escapeHtml(kind)}">Loading…</div>
+              <div class="metric-note js-bench-window" data-kind="${escapeHtml(kind)}">Window ${formatWindow(hours)}</div>
+            </div>
+          </div>
+
+          <div class="plot-box">
+            <img class="js-bench-plot" data-kind="${escapeHtml(kind)}" alt="${escapeHtml(title)} graph">
+          </div>
+
+          <details class="tech">
+            <summary>History and controls</summary>
+
+            <div class="settings-actions" style="margin:10px 0 8px;">
+              <div class="save-msg js-bench-error" data-kind="${escapeHtml(kind)}"></div>
+              <button type="button" class="secondary js-bench-reset" data-kind="${escapeHtml(kind)}">Reset history</button>
+            </div>
+
+            <div class="tech-grid">
+              <div class="tech-item">
+                <div class="tiny">Samples / read</div>
+                <div><strong class="js-bench-samples" data-kind="${escapeHtml(kind)}">—</strong></div>
+              </div>
+              <div class="tech-item">
+                <div class="tiny">Valid points</div>
+                <div><strong class="js-bench-points" data-kind="${escapeHtml(kind)}">—</strong></div>
+              </div>
+              <div class="tech-item">
+                <div class="tiny">Minimum</div>
+                <div><strong class="js-bench-min" data-kind="${escapeHtml(kind)}">—</strong></div>
+              </div>
+              <div class="tech-item">
+                <div class="tiny">Maximum</div>
+                <div><strong class="js-bench-max" data-kind="${escapeHtml(kind)}">—</strong></div>
+              </div>
+            </div>
+
+            <div class="section-card" style="margin-top:12px;">
+              <div class="metric-label" style="margin-bottom:10px;">Recent changed readings</div>
+              <div class="recent-empty js-bench-recent-empty" data-kind="${escapeHtml(kind)}">Loading…</div>
+              <table class="recent-table js-bench-recent-table" data-kind="${escapeHtml(kind)}" hidden>
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Value</th>
+                    <th>Aux</th>
+                  </tr>
+                </thead>
+                <tbody class="js-bench-recent-body" data-kind="${escapeHtml(kind)}"></tbody>
+              </table>
+            </div>
+          </details>
+        </div>
+      `;
+    }
+
+    function renderBenchPanel() {
+      const open = loadExpandedState("bench_suite", false);
+
+      return `
+        <details class="station" data-station-id="bench_suite" ${open ? "open" : ""}>
+          <summary>
+            <div class="summary-left">
+              <span class="status-dot online"></span>
+              <div class="summary-text">
+                <div class="station-name">Bench Sensors</div>
+                <div class="station-meta">pH and temperature refresh from cached background reads so the page does not touch hardware directly</div>
+              </div>
+            </div>
+            <div class="summary-right">
+              <div class="pill count-badge">Bench module</div>
+            </div>
+          </summary>
+
+          <div class="station-body">
+            <div class="probe-grid">
+              ${renderBenchCard("ph", "Bench pH Probe", "Atlas Surveyor through ADS1115")}
+              ${renderBenchCard("temp", "Bench Temperature Probe", "Atlas EZO RTD on non-isolated carrier board")}
+            </div>
+          </div>
+        </details>
+      `;
+    }
+
+    function benchConfig(kind) {
+      return {
+        ph: {
+          live: "/api/ph-live",
+          metrics: "/api/ph-metrics",
+          recent: "/api/ph-recent?limit=25",
+          reset: "/api/ph-reset",
+          plot: "/plot/ph.svg",
+          fmtMain: fmtPH,
+          fmtAuxLive: (live) => live.voltage === null ? "Voltage —" : `Voltage ${fmtVoltage(live.voltage)}`,
+          fmtMinMax: fmtPH,
+          recentValue: (row) => fmtPH(row.ph),
+          recentAux: (row) => fmtVoltage(row.voltage),
+          valueKey: "ph",
+        },
+        temp: {
+          live: "/api/temp-live",
+          metrics: "/api/temp-metrics",
+          recent: "/api/temp-recent?limit=25",
+          reset: "/api/temp-reset",
+          plot: "/plot/temp.svg",
+          fmtMain: fmtTemp,
+          fmtAuxLive: () => "Atlas RTD live read",
+          fmtMinMax: fmtTemp,
+          recentValue: (row) => fmtTemp(row.temp_c),
+          recentAux: () => "RTD",
+          valueKey: "temp_c",
+        }
+      }[kind];
+    }
+
+    function setBenchUnavailable(kind, message) {
+      const card = document.querySelector(`.js-bench-card[data-kind="${CSS.escape(kind)}"]`);
       if (!card) return;
 
-      const liveRes = await fetch("/api/ph-live");
-      const live = await liveRes.json();
+      card.classList.remove("ok", "warn", "bad", "nodata");
+      card.classList.add("nodata");
+
+      const dot = document.querySelector(`.js-bench-dot[data-kind="${CSS.escape(kind)}"]`);
+      if (dot) dot.className = "status-dot offline js-bench-dot";
+
+      const state = document.querySelector(`.js-bench-state[data-kind="${CSS.escape(kind)}"]`);
+      if (state) {
+        state.className = "pill nodata js-bench-state";
+        state.textContent = "Unavailable";
+      }
+
+      const err = document.querySelector(`.js-bench-error[data-kind="${CSS.escape(kind)}"]`);
+      if (err) err.textContent = message || "";
+    }
+
+    async function refreshBenchCard(kind, full = false) {
+      const cfg = benchConfig(kind);
+      const live = await safeFetchJson(cfg.live);
+
+      const card = document.querySelector(`.js-bench-card[data-kind="${CSS.escape(kind)}"]`);
+      if (!card) return;
 
       const cls = stateClass(live.state);
       card.classList.remove("ok", "warn", "bad", "nodata");
       card.classList.add(cls);
 
-      const pillTop = document.querySelector(".js-ph-state");
-      pillTop.className = `pill ${cls} js-ph-state`;
-      pillTop.textContent = live.state?.text || "Unavailable";
+      const dot = document.querySelector(`.js-bench-dot[data-kind="${CSS.escape(kind)}"]`);
+      if (dot) dot.className = `status-dot ${live.ok ? "online" : "offline"} js-bench-dot`;
 
-      const pillInner = document.querySelector(".js-ph-state-inner");
-      pillInner.className = `pill ${cls} js-ph-state-inner`;
-      pillInner.textContent = live.state?.text || "Unavailable";
+      const state = document.querySelector(`.js-bench-state[data-kind="${CSS.escape(kind)}"]`);
+      if (state) {
+        state.className = `pill ${cls} js-bench-state`;
+        state.textContent = live.state?.text || "Unavailable";
+      }
 
-      const dot = document.querySelector(".js-ph-dot");
-      dot.className = `status-dot ${live.ok ? "online" : "offline"} js-ph-dot`;
+      document.querySelector(`.js-bench-current[data-kind="${CSS.escape(kind)}"]`).textContent =
+        cfg.fmtMain(live[cfg.valueKey]);
 
-      card.querySelector(".js-ph-current").textContent = fmtPH(live.ph);
-      card.querySelector(".js-ph-voltage").textContent = live.voltage === null ? "Voltage —" : `Voltage ${fmtVoltage(live.voltage)}`;
-      card.querySelector(".js-ph-samples").textContent = String(Number(live.samples || 0));
-      card.querySelector(".js-ph-updated").textContent = live.ok && live.updated_at ? `Live read · ${fmtDateTime(live.updated_at)}` : "Live read unavailable";
-      card.querySelector(".js-ph-error").textContent = live.error ? `Reader error: ${live.error}` : "";
-      document.querySelector(".js-ph-last-ts").textContent = live.ok && live.updated_at ? fmtDateTime(live.updated_at) : "—";
-      document.querySelector(".js-ph-meta").textContent = live.ok
-        ? `Atlas Surveyor direct read via ADS1115 · updated just now`
-        : `Atlas Surveyor direct read via ADS1115 · unavailable`;
+      document.querySelector(`.js-bench-secondary[data-kind="${CSS.escape(kind)}"]`).textContent =
+        cfg.fmtAuxLive(live);
+
+      document.querySelector(`.js-bench-samples[data-kind="${CSS.escape(kind)}"]`).textContent =
+        String(Number(live.samples || 0));
+
+      document.querySelector(`.js-bench-updated[data-kind="${CSS.escape(kind)}"]`).textContent =
+        live.updated_at ? `Updated ${fmtDateTime(live.updated_at)}` : "Waiting for first sample…";
+
+      const err = document.querySelector(`.js-bench-error[data-kind="${CSS.escape(kind)}"]`);
+      if (err) err.textContent = live.error || "";
 
       if (!full) return;
 
-      const hours = getPhHours();
+      const hours = getBenchHours(kind, 24);
+      const metrics = await safeFetchJson(`${cfg.metrics}?hours=${hours}`);
 
-      const metricsRes = await fetch(`/api/ph-metrics?hours=${hours}`);
-      const metrics = await metricsRes.json();
+      document.querySelector(`.js-bench-avg[data-kind="${CSS.escape(kind)}"]`).textContent =
+        metrics.avg === null ? "—" : cfg.fmtMain(metrics.avg);
 
-      card.querySelector(".js-ph-avg").textContent = metrics.avg === null ? "—" : fmtPH(metrics.avg);
-      card.querySelector(".js-ph-window").textContent = `Window ${formatWindow(hours)}`;
-      card.querySelector(".js-ph-points").textContent = String(Number(metrics.points || 0));
-      card.querySelector(".js-ph-min").textContent = metrics.min === null ? "—" : fmtPH(metrics.min);
-      card.querySelector(".js-ph-max").textContent = metrics.max === null ? "—" : fmtPH(metrics.max);
+      document.querySelector(`.js-bench-window[data-kind="${CSS.escape(kind)}"]`).textContent =
+        `Window ${formatWindow(hours)}`;
 
-      if (metrics.last_ts) {
-        document.querySelector(".js-ph-last-ts").textContent = fmtDateTime(metrics.last_ts);
-      }
+      document.querySelector(`.js-bench-points[data-kind="${CSS.escape(kind)}"]`).textContent =
+        String(Number(metrics.points || 0));
 
-      const recentRes = await fetch("/api/ph-recent?limit=10");
-      const recent = await recentRes.json();
+      document.querySelector(`.js-bench-min[data-kind="${CSS.escape(kind)}"]`).textContent =
+        metrics.min === null ? "—" : cfg.fmtMinMax(metrics.min);
 
-      const empty = card.querySelector(".js-ph-recent-empty");
-      const table = card.querySelector(".js-ph-recent-table");
-      const body = card.querySelector(".js-ph-recent-body");
+      document.querySelector(`.js-bench-max[data-kind="${CSS.escape(kind)}"]`).textContent =
+        metrics.max === null ? "—" : cfg.fmtMinMax(metrics.max);
+
+      const plot = document.querySelector(`.js-bench-plot[data-kind="${CSS.escape(kind)}"]`);
+      if (plot) plot.src = `${cfg.plot}?hours=${hours}&_=${Date.now()}`;
+
+      const recent = await safeFetchJson(cfg.recent);
+      const empty = document.querySelector(`.js-bench-recent-empty[data-kind="${CSS.escape(kind)}"]`);
+      const table = document.querySelector(`.js-bench-recent-table[data-kind="${CSS.escape(kind)}"]`);
+      const body = document.querySelector(`.js-bench-recent-body[data-kind="${CSS.escape(kind)}"]`);
 
       if (!recent.length) {
         empty.hidden = false;
         table.hidden = true;
-        empty.textContent = "No logged pH changes yet.";
+        empty.textContent = "No logged changes yet.";
       } else {
         empty.hidden = true;
         table.hidden = false;
         body.innerHTML = recent.map(row => `
           <tr>
             <td>${escapeHtml(fmtDateTime(row.ts))}</td>
-            <td>${escapeHtml(fmtPH(row.ph))}</td>
-            <td>${escapeHtml(fmtVoltage(row.voltage))}</td>
+            <td>${escapeHtml(cfg.recentValue(row))}</td>
+            <td>${escapeHtml(cfg.recentAux(row))}</td>
           </tr>
         `).join("");
       }
     }
 
+    async function refreshBenchPanel(full = false) {
+      for (const kind of ["ph", "temp"]) {
+        try {
+          await refreshBenchCard(kind, full);
+        } catch (err) {
+          setBenchUnavailable(kind, err.message || String(err));
+        }
+      }
+    }
+
+    function mountBenchPanel() {
+      const slot = document.getElementById("bench-slot");
+      if (!slot) return;
+
+      slot.innerHTML = renderBenchPanel();
+
+      const details = slot.querySelector('.station[data-station-id="bench_suite"]');
+      if (details) {
+        details.addEventListener("toggle", () => {
+          saveExpandedState("bench_suite", details.open);
+        });
+      }
+
+      slot.addEventListener("change", async (event) => {
+        if (event.target.matches(".js-bench-range")) {
+          const kind = event.target.dataset.kind;
+          const hours = Number(event.target.value);
+          setBenchHours(kind, hours);
+          await refreshBenchCard(kind, true);
+        }
+      });
+
+      slot.addEventListener("click", async (event) => {
+        if (event.target.matches(".js-bench-reset")) {
+          const kind = event.target.dataset.kind;
+          await safeFetchJson(benchConfig(kind).reset, 5000, { method: "POST" });
+          await refreshBenchCard(kind, true);
+        }
+      });
+    }
+
     async function attachDynamicHandlers() {
-      document.querySelectorAll('.station[data-station-id]:not([data-station-id="bench_ph"])').forEach(stationEl => {
+      document.querySelectorAll('.station[data-station-id]:not([data-station-id="bench_suite"])').forEach(stationEl => {
         stationEl.addEventListener("toggle", () => {
           saveExpandedState(stationEl.dataset.stationId, stationEl.open);
         });
@@ -1952,27 +2488,33 @@ def home():
 
     async function loadDashboard() {
       const content = document.getElementById("content");
-      const res = await fetch("/api/dashboard");
-      const stations = await res.json();
 
-      if (!stations.length) {
+      try {
+        const res = await fetch("/api/dashboard", { cache: "no-store" });
+        const stations = await res.json();
+
+        if (!stations.length) {
+          content.className = "empty";
+          content.innerHTML = "No station data received yet.";
+          return;
+        }
+
+        content.className = "";
+        content.innerHTML = stations.map(renderStation).join("");
+        await attachDynamicHandlers();
+      } catch (err) {
         content.className = "empty";
-        content.innerHTML = "No station data received yet.";
-        return;
+        content.innerHTML = `Dashboard load failed: ${escapeHtml(err.message || String(err))}`;
       }
-
-      content.className = "";
-      content.innerHTML = stations.map(renderStation).join("");
-      await attachDynamicHandlers();
     }
 
     mountBenchPanel();
-    refreshPhPanel(true);
+    refreshBenchPanel(true);
     loadDashboard();
 
     setInterval(loadDashboard, 60000);
-    setInterval(() => refreshPhPanel(false), 5000);
-    setInterval(() => refreshPhPanel(true), 30000);
+    setInterval(() => refreshBenchPanel(false), 5000);
+    setInterval(() => refreshBenchPanel(true), 30000);
   </script>
 </body>
 </html>
@@ -1986,5 +2528,7 @@ def home():
 if __name__ == "__main__":
     init_db()
     init_ph_hardware()
-    start_ph_logger()
+    init_temp_hardware()
+    start_bench_logger()
     app.run(host="0.0.0.0", port=5000, debug=False)
+
