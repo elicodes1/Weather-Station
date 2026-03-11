@@ -5,6 +5,7 @@ import io
 import json
 import math
 import time
+import threading
 from statistics import median
 
 import matplotlib
@@ -71,7 +72,9 @@ PH_ADC_GAIN = 1               # +/- 4.096 V range
 PH_SAMPLES = 9
 PH_SAMPLE_DELAY = 0.03
 PH_LOG_EVERY_SECONDS = 15
-PH_DEFAULT_HOURS = 1
+PH_DEFAULT_HOURS = 24
+PH_RECENT_LIMIT = 10
+PH_CHANGE_EPSILON = 0.02
 
 # Atlas Surveyor transfer function:
 # pH = (-5.6548 * voltage) + 15.509
@@ -88,6 +91,8 @@ _ph_ads = None
 _ph_chan = None
 _ph_error = ADS_IMPORT_ERROR
 _ph_last_logged = None
+_ph_thread = None
+_ph_stop = threading.Event()
 
 
 def db():
@@ -253,6 +258,39 @@ def get_probe_configs(conn, station_id):
 # ----------------------------
 # pH helpers
 # ----------------------------
+def surveyor_voltage_to_ph(voltage):
+    raw_ph = (PH_SLOPE * float(voltage)) + PH_INTERCEPT
+    return (raw_ph * PH_CAL_SCALE) + PH_CAL_OFFSET
+
+
+def ph_state_from_reading(voltage, ph_value):
+    if voltage is None or ph_value is None:
+        return {"cls": "nodata", "text": "No valid reading"}
+
+    if voltage < (PH_VOLTS_MIN - 0.10) or voltage > (PH_VOLTS_MAX + 0.10):
+        return {"cls": "warn", "text": "Check probe / wiring"}
+
+    return {"cls": "ok", "text": "Live"}
+
+
+def build_ads_channel(ads):
+    """
+    Tries both the newer constant style (ADS.P0) and a raw integer fallback.
+    Your error shows some installs do not expose ADS.P0.
+    """
+    names = {0: "P0", 1: "P1", 2: "P2", 3: "P3"}
+    channel_name = names.get(PH_CHANNEL_INDEX)
+
+    if channel_name and hasattr(ADS, channel_name):
+        try:
+            return AnalogIn(ads, getattr(ADS, channel_name))
+        except Exception:
+            pass
+
+    # Fallback for installs that accept numeric channel ids
+    return AnalogIn(ads, PH_CHANNEL_INDEX)
+
+
 def init_ph_hardware():
     global _ph_ads, _ph_chan, _ph_error
 
@@ -272,35 +310,13 @@ def init_ph_hardware():
         ads = ADS.ADS1115(i2c)
         ads.gain = PH_ADC_GAIN
 
-        channel_map = {
-            0: ADS.P0,
-            1: ADS.P1,
-            2: ADS.P2,
-            3: ADS.P3,
-        }
-
         _ph_ads = ads
-        _ph_chan = AnalogIn(ads, channel_map[PH_CHANNEL_INDEX])
+        _ph_chan = build_ads_channel(ads)
         _ph_error = None
     except Exception as exc:
         _ph_ads = None
         _ph_chan = None
         _ph_error = str(exc)
-
-
-def surveyor_voltage_to_ph(voltage):
-    raw_ph = (PH_SLOPE * float(voltage)) + PH_INTERCEPT
-    return (raw_ph * PH_CAL_SCALE) + PH_CAL_OFFSET
-
-
-def ph_state_from_reading(voltage, ph_value):
-    if voltage is None or ph_value is None:
-        return {"cls": "nodata", "text": "No valid reading"}
-
-    if voltage < (PH_VOLTS_MIN - 0.10) or voltage > (PH_VOLTS_MAX + 0.10):
-        return {"cls": "warn", "text": "Check probe / wiring"}
-
-    return {"cls": "ok", "text": "Live"}
 
 
 def read_live_ph(samples=PH_SAMPLES, sample_delay=PH_SAMPLE_DELAY):
@@ -380,6 +396,29 @@ def maybe_log_ph(ph_data):
     conn.close()
 
     _ph_last_logged = now
+
+
+def ph_logger_loop():
+    while not _ph_stop.is_set():
+        try:
+            data = read_live_ph()
+            if data.get("ok"):
+                maybe_log_ph(data)
+        except Exception as exc:
+            print("pH logger error:", exc, flush=True)
+
+        _ph_stop.wait(PH_LOG_EVERY_SECONDS)
+
+
+def start_ph_logger():
+    global _ph_thread
+    if not PH_ENABLED:
+        return
+    if _ph_thread and _ph_thread.is_alive():
+        return
+
+    _ph_thread = threading.Thread(target=ph_logger_loop, name="ph-logger", daemon=True)
+    _ph_thread.start()
 
 
 def init_db():
@@ -694,7 +733,8 @@ def api_ph_metrics():
             AVG(ph_value) AS avg_value,
             MIN(ph_value) AS min_value,
             MAX(ph_value) AS max_value,
-            AVG(ph_voltage) AS avg_voltage
+            AVG(ph_voltage) AS avg_voltage,
+            MAX(ts) AS last_ts
         FROM ph_readings
         WHERE ts >= ?
     """, (since,)).fetchone()
@@ -707,7 +747,44 @@ def api_ph_metrics():
         "min": None if stats["min_value"] is None else float(stats["min_value"]),
         "max": None if stats["max_value"] is None else float(stats["max_value"]),
         "avg_voltage": None if stats["avg_voltage"] is None else float(stats["avg_voltage"]),
+        "last_ts": stats["last_ts"],
     })
+
+
+@app.route("/api/ph-recent")
+def api_ph_recent():
+    limit = max(1, min(50, request.args.get("limit", PH_RECENT_LIMIT, type=int)))
+
+    conn = db()
+    rows = conn.execute("""
+        SELECT ts, ph_voltage, ph_value
+        FROM ph_readings
+        WHERE ph_value IS NOT NULL
+        ORDER BY ts DESC
+        LIMIT 250
+    """).fetchall()
+    conn.close()
+
+    recent = []
+    last_value = None
+
+    for row in rows:
+        val = safe_num(row["ph_value"], math.nan)
+        if not math.isfinite(val):
+            continue
+
+        if last_value is None or abs(val - last_value) >= PH_CHANGE_EPSILON:
+            recent.append({
+                "ts": row["ts"],
+                "ph": round(val, 2),
+                "voltage": None if row["ph_voltage"] is None else round(float(row["ph_voltage"]), 4),
+            })
+            last_value = val
+
+        if len(recent) >= limit:
+            break
+
+    return jsonify(recent)
 
 
 @app.route("/plot/<station_id>/<probe_key>.svg")
@@ -779,63 +856,6 @@ def plot_probe(station_id, probe_key):
     return Response(buf.getvalue(), mimetype="image/svg+xml")
 
 
-@app.route("/plot/ph.svg")
-def plot_ph():
-    hours = clamp_hours(request.args.get("hours", PH_DEFAULT_HOURS, type=int))
-    since = (utc_now() - timedelta(hours=hours)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-    conn = db()
-    rows = conn.execute("""
-        SELECT ts, ph_value
-        FROM ph_readings
-        WHERE ts >= ?
-        ORDER BY ts ASC
-    """, (since,)).fetchall()
-    conn.close()
-
-    fig, ax = plt.subplots(figsize=(10, 3.3))
-    values = []
-    times = []
-
-    for row in rows:
-        times.append(parse_iso(row["ts"]))
-        values.append(safe_num(row["ph_value"], math.nan))
-
-    valid_points = sum(0 if math.isnan(v) else 1 for v in values)
-
-    if valid_points:
-        ax.axhline(7.0, linewidth=1.0, alpha=0.25, linestyle="--")
-        ax.plot(times, values, linewidth=2.4)
-        ax.set_ylim(0, 14)
-        ax.set_ylabel("pH")
-        ax.grid(True, alpha=0.28)
-
-        if hours <= 1:
-            locator = mdates.MinuteLocator(interval=10)
-        elif hours <= 24:
-            locator = mdates.HourLocator(interval=2)
-        else:
-            locator = mdates.DayLocator(interval=1)
-
-        ax.xaxis.set_major_locator(locator)
-        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
-    else:
-        ax.text(0.5, 0.54, "No valid pH data in selected window", ha="center", va="center", transform=ax.transAxes)
-        ax.text(0.5, 0.40, "Open the page and let the live logger collect a few samples.", ha="center", va="center", fontsize=9, transform=ax.transAxes)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        for spine in ax.spines.values():
-            spine.set_visible(False)
-
-    ax.set_title(f"{PH_NAME} · last {hours}h")
-    fig.tight_layout()
-
-    buf = io.StringIO()
-    fig.savefig(buf, format="svg", bbox_inches="tight")
-    plt.close(fig)
-    return Response(buf.getvalue(), mimetype="image/svg+xml")
-
-
 @app.route("/")
 def home():
     html = """
@@ -843,7 +863,7 @@ def home():
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Weather Station Host</title>
+  <title>Sensor Host</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     :root {
@@ -923,7 +943,7 @@ def home():
       box-shadow: var(--shadow);
     }
 
-    #ph-live-slot {
+    #bench-slot {
       margin-bottom: 18px;
     }
 
@@ -1221,6 +1241,10 @@ def home():
       gap: 10px;
     }
 
+    .metrics.two {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
     .metric {
       border: 1px solid var(--border);
       border-radius: 14px;
@@ -1270,6 +1294,31 @@ def home():
       border-radius: 10px;
     }
 
+    .recent-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.94rem;
+    }
+
+    .recent-table th,
+    .recent-table td {
+      text-align: left;
+      padding: 10px 8px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .recent-table th {
+      color: var(--muted);
+      font-size: 0.82rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .recent-empty {
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
     .tech summary {
       padding: 0;
       background: transparent;
@@ -1306,7 +1355,7 @@ def home():
     @media (max-width: 760px) {
       .wrap { padding: 14px; }
       h1 { font-size: 1.65rem; }
-      .metrics { grid-template-columns: 1fr; }
+      .metrics, .metrics.two { grid-template-columns: 1fr; }
       .station summary { padding: 14px; align-items: flex-start; }
       .summary-right { justify-content: flex-start; }
     }
@@ -1316,13 +1365,13 @@ def home():
   <div class="wrap">
     <div class="topbar">
       <div>
-        <h1>Weather Station Host</h1>
-        <div class="subhead">Station probes refresh every 60 seconds · bench pH is live</div>
+        <h1>Sensor Host</h1>
+        <div class="subhead">Field stations refresh every 60 seconds · bench pH refreshes live</div>
       </div>
-      <div class="global-note">Tip: open a unit, rename probes, and adjust thresholds live from the settings panel.</div>
+      <div class="global-note">Tip: open a unit, rename probes, adjust thresholds, and keep the bench module collapsed when you are outside.</div>
     </div>
 
-    <div id="ph-live-slot"></div>
+    <div id="bench-slot"></div>
     <div id="content" class="loading">Loading dashboard…</div>
   </div>
 
@@ -1374,6 +1423,17 @@ def home():
 
     function stateClass(state) {
       return state?.cls || "nodata";
+    }
+
+    function fmtDateTime(ts) {
+      if (!ts) return "—";
+      try {
+        const d = new Date(ts);
+        if (Number.isNaN(d.getTime())) return ts;
+        return d.toLocaleString();
+      } catch {
+        return ts;
+      }
     }
 
     function loadExpandedState(stationId, fallbackCollapsed) {
@@ -1601,76 +1661,108 @@ def home():
       `;
     }
 
-    function renderPhPanel() {
+    function renderBenchPanel() {
       const hours = getPhHours();
+      const open = loadExpandedState("bench_ph", false);
 
       return `
-        <div class="probe-card nodata" id="ph-card">
-          <div class="probe-head">
-            <div>
-              <h3 class="probe-name">${escapeHtml("Bench pH Probe")}</h3>
-              <div class="probe-sub">${escapeHtml("Atlas Surveyor live read from Raspberry Pi")}</div>
-            </div>
-            <div class="pill nodata js-ph-state">Starting…</div>
-          </div>
-
-          <div class="probe-toolbar">
-            <div class="tiny js-ph-updated">Waiting for first live sample…</div>
-            <div class="range-wrap">
-              <label>Graph range</label>
-              <select id="ph-range">
-                <option value="1" ${hours === 1 ? "selected" : ""}>Last 1 hour</option>
-                <option value="24" ${hours === 24 ? "selected" : ""}>Last 24 hours</option>
-                <option value="168" ${hours === 168 ? "selected" : ""}>Last 7 days</option>
-              </select>
-            </div>
-          </div>
-
-          <div class="metrics">
-            <div class="metric">
-              <div class="metric-label">Current</div>
-              <div class="metric-value js-ph-current">Loading…</div>
-              <div class="metric-note js-ph-voltage">Voltage —</div>
-            </div>
-            <div class="metric">
-              <div class="metric-label">Average</div>
-              <div class="metric-value js-ph-avg">Loading…</div>
-              <div class="metric-note js-ph-window">Window ${formatWindow(hours)}</div>
-            </div>
-            <div class="metric target-band">
-              <div class="metric-label">Mode</div>
-              <div class="metric-value">Live</div>
-              <div class="metric-note">Direct Pi read</div>
-            </div>
-          </div>
-
-          <div class="plot-box">
-            <img id="ph-plot" alt="Graph for bench pH probe">
-          </div>
-
-          <details class="tech">
-            <summary>Technical data</summary>
-            <div class="tech-grid">
-              <div class="tech-item">
-                <div class="tiny">Samples / read</div>
-                <div><strong class="js-ph-samples">—</strong></div>
-              </div>
-              <div class="tech-item">
-                <div class="tiny">Valid points</div>
-                <div><strong class="js-ph-points">—</strong></div>
-              </div>
-              <div class="tech-item">
-                <div class="tiny">Minimum</div>
-                <div><strong class="js-ph-min">—</strong></div>
-              </div>
-              <div class="tech-item">
-                <div class="tiny">Maximum</div>
-                <div><strong class="js-ph-max">—</strong></div>
+        <details class="station" data-station-id="bench_ph" ${open ? "open" : ""}>
+          <summary>
+            <div class="summary-left">
+              <span class="status-dot offline js-ph-dot"></span>
+              <div class="summary-text">
+                <div class="station-name">${escapeHtml("Bench pH Probe")}</div>
+                <div class="station-meta js-ph-meta">${escapeHtml("Atlas Surveyor direct read via ADS1115 · waiting for first sample")}</div>
               </div>
             </div>
-            <div class="tiny js-ph-error" style="margin-top:8px;"></div>
-          </details>
-        </div>
+            <div class="summary-right">
+              <div class="pill nodata js-ph-state">Starting…</div>
+              <div class="pill count-badge">Bench module</div>
+            </div>
+          </summary>
+
+          <div class="station-body">
+            <div class="station-info">
+              <div><strong>Module:</strong> Bench pH</div>
+              <div><strong>Last updated:</strong> <span class="js-ph-last-ts">—</span></div>
+            </div>
+
+            <div class="probe-grid" style="grid-template-columns: 1fr;">
+              <div class="probe-card nodata" id="ph-card">
+                <div class="probe-head">
+                  <div>
+                    <h3 class="probe-name">${escapeHtml("Bench pH Probe")}</h3>
+                    <div class="probe-sub">${escapeHtml("Bench-side pH logging on Raspberry Pi")}</div>
+                  </div>
+                  <div class="pill nodata js-ph-state-inner">Starting…</div>
+                </div>
+
+                <div class="probe-toolbar">
+                  <div class="tiny js-ph-updated">Waiting for first live sample…</div>
+                  <div class="range-wrap">
+                    <label>Window</label>
+                    <select id="ph-range">
+                      <option value="1" ${hours === 1 ? "selected" : ""}>Last 1 hour</option>
+                      <option value="24" ${hours === 24 ? "selected" : ""}>Last 24 hours</option>
+                      <option value="168" ${hours === 168 ? "selected" : ""}>Last 7 days</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div class="metrics two">
+                  <div class="metric">
+                    <div class="metric-label">Current</div>
+                    <div class="metric-value js-ph-current">Loading…</div>
+                    <div class="metric-note js-ph-voltage">Voltage —</div>
+                  </div>
+                  <div class="metric">
+                    <div class="metric-label">Average</div>
+                    <div class="metric-value js-ph-avg">Loading…</div>
+                    <div class="metric-note js-ph-window">Window ${formatWindow(hours)}</div>
+                  </div>
+                </div>
+
+                <div class="section-card">
+                  <div class="metric-label" style="margin-bottom:10px;">Last 10 changed readings</div>
+                  <div class="recent-empty js-ph-recent-empty">Loading…</div>
+                  <table class="recent-table js-ph-recent-table" hidden>
+                    <thead>
+                      <tr>
+                        <th>Time</th>
+                        <th>pH</th>
+                        <th>Voltage</th>
+                      </tr>
+                    </thead>
+                    <tbody class="js-ph-recent-body"></tbody>
+                  </table>
+                </div>
+
+                <details class="tech">
+                  <summary>Technical data</summary>
+                  <div class="tech-grid">
+                    <div class="tech-item">
+                      <div class="tiny">Samples / read</div>
+                      <div><strong class="js-ph-samples">—</strong></div>
+                    </div>
+                    <div class="tech-item">
+                      <div class="tiny">Valid points</div>
+                      <div><strong class="js-ph-points">—</strong></div>
+                    </div>
+                    <div class="tech-item">
+                      <div class="tiny">Minimum</div>
+                      <div><strong class="js-ph-min">—</strong></div>
+                    </div>
+                    <div class="tech-item">
+                      <div class="tiny">Maximum</div>
+                      <div><strong class="js-ph-max">—</strong></div>
+                    </div>
+                  </div>
+                  <div class="tiny js-ph-error" style="margin-top:8px;"></div>
+                </details>
+              </div>
+            </div>
+          </div>
+        </details>
       `;
     }
 
@@ -1739,15 +1831,24 @@ def home():
       await loadDashboard();
     }
 
-    function mountPhPanel() {
-      const slot = document.getElementById("ph-live-slot");
+    function mountBenchPanel() {
+      const slot = document.getElementById("bench-slot");
       if (!slot) return;
 
-      slot.innerHTML = renderPhPanel();
+      slot.innerHTML = renderBenchPanel();
 
-      document.getElementById("ph-range").addEventListener("change", async (event) => {
-        setPhHours(Number(event.target.value));
-        await refreshPhPanel(true);
+      const range = document.getElementById("ph-range");
+      if (range) {
+        range.addEventListener("change", async (event) => {
+          setPhHours(Number(event.target.value));
+          await refreshPhPanel(true);
+        });
+      }
+
+      document.querySelectorAll('.station[data-station-id="bench_ph"]').forEach(stationEl => {
+        stationEl.addEventListener("toggle", () => {
+          saveExpandedState("bench_ph", stationEl.open);
+        });
       });
     }
 
@@ -1762,19 +1863,31 @@ def home():
       card.classList.remove("ok", "warn", "bad", "nodata");
       card.classList.add(cls);
 
-      const pill = card.querySelector(".js-ph-state");
-      pill.className = `pill ${cls} js-ph-state`;
-      pill.textContent = live.state?.text || "Unavailable";
+      const pillTop = document.querySelector(".js-ph-state");
+      pillTop.className = `pill ${cls} js-ph-state`;
+      pillTop.textContent = live.state?.text || "Unavailable";
+
+      const pillInner = document.querySelector(".js-ph-state-inner");
+      pillInner.className = `pill ${cls} js-ph-state-inner`;
+      pillInner.textContent = live.state?.text || "Unavailable";
+
+      const dot = document.querySelector(".js-ph-dot");
+      dot.className = `status-dot ${live.ok ? "online" : "offline"} js-ph-dot`;
 
       card.querySelector(".js-ph-current").textContent = fmtPH(live.ph);
       card.querySelector(".js-ph-voltage").textContent = live.voltage === null ? "Voltage —" : `Voltage ${fmtVoltage(live.voltage)}`;
       card.querySelector(".js-ph-samples").textContent = String(Number(live.samples || 0));
-      card.querySelector(".js-ph-updated").textContent = live.ok ? "Live ADS1115 read" : "Live read unavailable";
+      card.querySelector(".js-ph-updated").textContent = live.ok && live.updated_at ? `Live read · ${fmtDateTime(live.updated_at)}` : "Live read unavailable";
       card.querySelector(".js-ph-error").textContent = live.error ? `Reader error: ${live.error}` : "";
+      document.querySelector(".js-ph-last-ts").textContent = live.ok && live.updated_at ? fmtDateTime(live.updated_at) : "—";
+      document.querySelector(".js-ph-meta").textContent = live.ok
+        ? `Atlas Surveyor direct read via ADS1115 · updated just now`
+        : `Atlas Surveyor direct read via ADS1115 · unavailable`;
 
       if (!full) return;
 
       const hours = getPhHours();
+
       const metricsRes = await fetch(`/api/ph-metrics?hours=${hours}`);
       const metrics = await metricsRes.json();
 
@@ -1784,12 +1897,36 @@ def home():
       card.querySelector(".js-ph-min").textContent = metrics.min === null ? "—" : fmtPH(metrics.min);
       card.querySelector(".js-ph-max").textContent = metrics.max === null ? "—" : fmtPH(metrics.max);
 
-      const plot = document.getElementById("ph-plot");
-      plot.src = `/plot/ph.svg?hours=${hours}&_=${Date.now()}`;
+      if (metrics.last_ts) {
+        document.querySelector(".js-ph-last-ts").textContent = fmtDateTime(metrics.last_ts);
+      }
+
+      const recentRes = await fetch("/api/ph-recent?limit=10");
+      const recent = await recentRes.json();
+
+      const empty = card.querySelector(".js-ph-recent-empty");
+      const table = card.querySelector(".js-ph-recent-table");
+      const body = card.querySelector(".js-ph-recent-body");
+
+      if (!recent.length) {
+        empty.hidden = false;
+        table.hidden = true;
+        empty.textContent = "No logged pH changes yet.";
+      } else {
+        empty.hidden = true;
+        table.hidden = false;
+        body.innerHTML = recent.map(row => `
+          <tr>
+            <td>${escapeHtml(fmtDateTime(row.ts))}</td>
+            <td>${escapeHtml(fmtPH(row.ph))}</td>
+            <td>${escapeHtml(fmtVoltage(row.voltage))}</td>
+          </tr>
+        `).join("");
+      }
     }
 
     async function attachDynamicHandlers() {
-      document.querySelectorAll(".station").forEach(stationEl => {
+      document.querySelectorAll('.station[data-station-id]:not([data-station-id="bench_ph"])').forEach(stationEl => {
         stationEl.addEventListener("toggle", () => {
           saveExpandedState(stationEl.dataset.stationId, stationEl.open);
         });
@@ -1829,7 +1966,7 @@ def home():
       await attachDynamicHandlers();
     }
 
-    mountPhPanel();
+    mountBenchPanel();
     refreshPhPanel(true);
     loadDashboard();
 
@@ -1849,4 +1986,5 @@ def home():
 if __name__ == "__main__":
     init_db()
     init_ph_hardware()
+    start_ph_logger()
     app.run(host="0.0.0.0", port=5000, debug=False)
