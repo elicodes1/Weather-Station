@@ -29,13 +29,14 @@ else:
     ADS_IMPORT_ERROR = None
 
 try:
-    from smbus2 import SMBus, i2c_msg
+    import serial
+    from serial import SerialException
 except Exception as exc:
-    SMBus = None
-    i2c_msg = None
-    ATLAS_I2C_IMPORT_ERROR = str(exc)
+    serial = None
+    SerialException = Exception
+    ATLAS_UART_IMPORT_ERROR = str(exc)
 else:
-    ATLAS_I2C_IMPORT_ERROR = None
+    ATLAS_UART_IMPORT_ERROR = None
 
 
 DB_PATH = "weather.db"
@@ -101,9 +102,10 @@ PH_CAL_OFFSET = 0.0
 
 TEMP_ENABLED = True
 TEMP_NAME = "Bench Temperature Probe"
-TEMP_DESCRIPTION = "Atlas EZO RTD on non-isolated carrier board"
-TEMP_I2C_ADDR = 0x66
-TEMP_I2C_BUS = 1
+TEMP_DESCRIPTION = "Atlas EZO RTD on UART"
+TEMP_UART_PORT = "/dev/serial0"
+TEMP_UART_BAUD = 9600
+TEMP_UART_TIMEOUT = 1.5
 TEMP_READ_DELAY = 1.0
 TEMP_LOG_EVERY_SECONDS = 15
 TEMP_DEFAULT_HOURS = 24
@@ -116,8 +118,8 @@ _ph_chan = None
 _ph_error = ADS_IMPORT_ERROR
 _ph_last_logged = None
 
-_temp_bus = None
-_temp_error = ATLAS_I2C_IMPORT_ERROR
+_temp_ser = None
+_temp_error = ATLAS_UART_IMPORT_ERROR
 _temp_last_logged = None
 
 _bench_lock = threading.Lock()
@@ -358,15 +360,15 @@ def reset_ph_hardware(reason=None):
 
 
 def reset_temp_hardware(reason=None):
-    global _temp_bus, _temp_error
+    global _temp_ser, _temp_error
     try:
-        if _temp_bus is not None:
+        if _temp_ser is not None:
             try:
-                _temp_bus.close()
+                _temp_ser.close()
             except Exception:
                 pass
     finally:
-        _temp_bus = None
+        _temp_ser = None
         if reason:
             _temp_error = str(reason)
 
@@ -407,55 +409,91 @@ def init_ph_hardware():
 
 
 def init_temp_hardware():
-    global _temp_bus, _temp_error
+    global _temp_ser, _temp_error
 
     if not TEMP_ENABLED:
         _temp_error = "Temperature disabled"
         return
 
-    if _temp_bus is not None:
+    if _temp_ser is not None and getattr(_temp_ser, "is_open", False):
         return
 
-    if SMBus is None or i2c_msg is None:
-        _temp_error = ATLAS_I2C_IMPORT_ERROR or "smbus2 not available"
+    if serial is None:
+        _temp_error = ATLAS_UART_IMPORT_ERROR or "pyserial not available"
         return
 
     try:
-        _temp_bus = SMBus(TEMP_I2C_BUS)
+        _temp_ser = serial.Serial(
+            TEMP_UART_PORT,
+            TEMP_UART_BAUD,
+            timeout=TEMP_UART_TIMEOUT,
+            write_timeout=TEMP_UART_TIMEOUT,
+        )
+        try:
+            _temp_ser.reset_input_buffer()
+            _temp_ser.reset_output_buffer()
+        except Exception:
+            pass
         _temp_error = None
     except Exception as exc:
         reset_temp_hardware(exc)
 
 
-def ezo_query(address, command="R", wait_s=1.0, read_bytes=32):
+def _temp_readline(timeout_s=2.0):
     init_temp_hardware()
 
-    if _temp_bus is None:
-        raise RuntimeError(_temp_error or "EZO RTD unavailable")
+    if _temp_ser is None:
+        raise RuntimeError(_temp_error or "RTD UART unavailable")
 
-    _temp_bus.i2c_rdwr(i2c_msg.write(address, command.encode("ascii")))
+    deadline = time.monotonic() + timeout_s
+    buf = bytearray()
+
+    while time.monotonic() < deadline:
+        chunk = _temp_ser.read(1)
+        if not chunk:
+            continue
+        if chunk == b'\x00':
+            continue
+        if chunk in (b'\r', b'\n'):
+            if buf:
+                break
+            continue
+        buf.extend(chunk)
+
+    return buf.decode("utf-8", errors="ignore").strip()
+
+
+def ezo_uart_query(command="R", wait_s=1.0):
+    init_temp_hardware()
+
+    if _temp_ser is None:
+        raise RuntimeError(_temp_error or "RTD UART unavailable")
+
+    try:
+        _temp_ser.reset_input_buffer()
+    except Exception:
+        pass
+
+    _temp_ser.write((command + "\r").encode("utf-8"))
+    _temp_ser.flush()
     time.sleep(wait_s)
 
-    read = i2c_msg.read(address, read_bytes)
-    _temp_bus.i2c_rdwr(read)
-    payload = bytes(read)
+    lines = []
+    end_time = time.monotonic() + max(1.2, TEMP_UART_TIMEOUT + wait_s)
+    while time.monotonic() < end_time:
+        line = _temp_readline(timeout_s=0.35)
+        if not line:
+            continue
+        lines.append(line)
+        try:
+            float(line)
+            return line
+        except Exception:
+            pass
 
-    if not payload:
-        raise RuntimeError("No response from EZO circuit")
-
-    code = payload[0]
-    text = payload[1:].split(b"\x00", 1)[0].decode("ascii", errors="ignore").strip()
-
-    if code == 1:
-        return text
-    if code == 254:
-        raise RuntimeError("RTD still processing")
-    if code == 255:
-        raise RuntimeError("RTD has no data")
-    if code == 2:
-        raise RuntimeError("RTD syntax error")
-
-    raise RuntimeError(f"RTD response code {code}: {text}")
+    if lines:
+        raise RuntimeError("; ".join(lines))
+    raise RuntimeError("No UART response from RTD")
 
 
 def read_live_ph_hw(samples=PH_SAMPLES, sample_delay=PH_SAMPLE_DELAY):
@@ -519,7 +557,7 @@ def read_live_ph_hw(samples=PH_SAMPLES, sample_delay=PH_SAMPLE_DELAY):
 def read_live_temp_hw():
     try:
         with _bench_lock:
-            text = ezo_query(TEMP_I2C_ADDR, "R", TEMP_READ_DELAY, 32)
+            text = ezo_uart_query("R", TEMP_READ_DELAY)
         temp_c = round(float(text), 2)
         return {
             "ok": True,
@@ -2282,7 +2320,7 @@ def home():
           <div class="station-body">
             <div class="probe-grid">
               ${renderBenchCard("ph", "Bench pH Probe", "Atlas Surveyor through ADS1115")}
-              ${renderBenchCard("temp", "Bench Temperature Probe", "Atlas EZO RTD on non-isolated carrier board")}
+              ${renderBenchCard("temp", "Bench Temperature Probe", "Atlas EZO RTD on UART")}
             </div>
           </div>
         </details>
@@ -2311,7 +2349,7 @@ def home():
           reset: "/api/temp-reset",
           plot: "/plot/temp.svg",
           fmtMain: fmtTemp,
-          fmtAuxLive: () => "Atlas RTD live read",
+          fmtAuxLive: () => "Atlas RTD UART read",
           fmtMinMax: fmtTemp,
           recentValue: (row) => fmtTemp(row.temp_c),
           recentAux: () => "RTD",
@@ -2531,4 +2569,3 @@ if __name__ == "__main__":
     init_temp_hardware()
     start_bench_logger()
     app.run(host="0.0.0.0", port=5000, debug=False)
-
