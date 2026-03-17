@@ -2648,16 +2648,16 @@ def home():
               <span class="status-dot online"></span>
               <div class="summary-text">
                 <div class="station-name">Bench Sensors</div>
-                <div class="station-meta">pH, RTD temperature, and TDS refresh from cached background reads so the page stays quick and does not touch the hardware directly</div>
+                <div class="station-meta">Refreshed from a chashed background</div>
               </div>
             </div>
             <div class="summary-right"><div class="pill count-badge">Bench module</div></div>
           </summary>
           <div class="station-body">
             <div class="probe-grid">
-              ${renderBenchSensorCard("ph", "Bench pH Probe", "Atlas Surveyor through ADS1115")}
-              ${renderBenchSensorCard("temp", "Bench Temperature Probe", "Atlas EZO RTD on UART")}
-              ${renderBenchSensorCard("tds", "Bench TDS Probe", "Inland TDS Meter on ADS1115 A1")}
+              ${renderBenchSensorCard("ph", "pH Probe", "Atlas Surveyor through ADS1115")}
+              ${renderBenchSensorCard("temp", "Temperature Probe", "Atlas EZO RTD on UART")}
+              ${renderBenchSensorCard("tds", "TDS Probe", "Inland TDS Meter on ADS1115 A1")}
             </div>
           </div>
         </details>
