@@ -466,9 +466,6 @@ def get_ph_calibration():
         conn.close()
 
 
-# ----------------------------
-# Bench helpers
-# ----------------------------
 def surveyor_voltage_to_ph(voltage):
     cal = get_ph_calibration()
     raw_ph = (PH_SLOPE * float(voltage)) + PH_INTERCEPT
@@ -2144,16 +2141,18 @@ def plot_probe(station_id, probe_key):
     plt.close(fig)
     return Response(buf.getvalue(), mimetype="image/svg+xml")
 
+from flask import Response
+import json
 
-@app.route("/")
+
 def home():
-    html = """
+    html = '''
 <!doctype html>
-<html lang=\"en\">
+<html lang="en">
 <head>
-  <meta charset=\"utf-8\">
+  <meta charset="utf-8">
   <title>Sensor Host</title>
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     :root {
       --bg: #eef2f5;
@@ -2187,7 +2186,7 @@ def home():
       color: var(--text);
     }
     .wrap {
-      max-width: 1240px;
+      max-width: 1380px;
       margin: 0 auto;
       padding: 20px;
     }
@@ -2216,7 +2215,7 @@ def home():
       box-shadow: var(--shadow);
       color: var(--muted);
       font-size: 0.95rem;
-      max-width: 460px;
+      max-width: 520px;
     }
     .empty, .loading {
       background: var(--panel);
@@ -2371,11 +2370,12 @@ def home():
       font-size: 1rem;
       font-weight: 800;
     }
-    .settings-actions {
+    .settings-actions,
+    .button-row {
       display: flex;
       justify-content: flex-end;
       align-items: center;
-      gap: 10px;
+      gap: 12px;
       flex-wrap: wrap;
     }
     .save-msg {
@@ -2392,6 +2392,7 @@ def home():
       font-size: 0.95rem;
       font-weight: 700;
       cursor: pointer;
+      line-height: 1.2;
     }
     button.secondary {
       background: #eef4ff;
@@ -2407,6 +2408,7 @@ def home():
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
       gap: 14px;
+      align-items: start;
     }
     .probe-card {
       background: var(--panel);
@@ -2415,6 +2417,7 @@ def home():
       padding: 14px;
       display: grid;
       gap: 12px;
+      align-self: start;
     }
     .probe-card.ok { border-color: var(--ok-border); background: linear-gradient(180deg, #ffffff 0%, #f7fcf9 100%); }
     .probe-card.warn { border-color: var(--warn-border); background: linear-gradient(180deg, #ffffff 0%, #fffaf0 100%); }
@@ -2433,13 +2436,6 @@ def home():
       font-weight: 800;
     }
     .probe-sub { color: var(--muted); font-size: 0.95rem; }
-    .probe-toolbar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-      flex-wrap: wrap;
-    }
     .range-wrap {
       display: inline-flex;
       align-items: center;
@@ -2474,7 +2470,8 @@ def home():
       background: #fcfdff;
       min-width: 0;
     }
-    .metric-label {
+    .metric-label,
+    .section-label {
       color: var(--muted);
       font-size: 0.80rem;
       margin-bottom: 6px;
@@ -2491,12 +2488,6 @@ def home():
       margin-top: 4px;
       color: var(--muted);
       font-size: 0.82rem;
-    }
-    .target-band {
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 12px;
-      background: #f8fbff;
     }
     .plot-box {
       border: 1px solid var(--border);
@@ -2594,39 +2585,46 @@ def home():
       color: var(--accent);
     }
 
-    .bench-sensor-card {
+    .bench-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
+      gap: 14px;
+      align-items: start;
+    }
+    .bench-card {
       border: 1px solid var(--border);
-      border-radius: 18px;
+      border-radius: 20px;
       background: var(--panel);
       overflow: hidden;
       box-shadow: inset 0 1px 0 rgba(255,255,255,0.7);
+      align-self: start;
     }
-    .bench-sensor-card.ok { border-color: var(--ok-border); background: linear-gradient(180deg, #ffffff 0%, #f7fcf9 100%); }
-    .bench-sensor-card.warn { border-color: var(--warn-border); background: linear-gradient(180deg, #ffffff 0%, #fffaf0 100%); }
-    .bench-sensor-card.bad { border-color: var(--bad-border); background: linear-gradient(180deg, #ffffff 0%, #fff5f5 100%); }
-    .bench-sensor-card.nodata { border-color: var(--nodata-border); background: linear-gradient(180deg, #ffffff 0%, #f7f9fb 100%); }
-    .bench-sensor-card > summary {
+    .bench-card.ok { border-color: var(--ok-border); background: linear-gradient(180deg, #ffffff 0%, #f7fcf9 100%); }
+    .bench-card.warn { border-color: var(--warn-border); background: linear-gradient(180deg, #ffffff 0%, #fffaf0 100%); }
+    .bench-card.bad { border-color: var(--bad-border); background: linear-gradient(180deg, #ffffff 0%, #fff5f5 100%); }
+    .bench-card.nodata { border-color: var(--nodata-border); background: linear-gradient(180deg, #ffffff 0%, #f7f9fb 100%); }
+    .bench-card > summary {
       list-style: none;
       cursor: pointer;
-      padding: 14px 16px;
+      padding: 16px;
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
       gap: 14px;
       align-items: center;
       background: transparent;
     }
-    .bench-sensor-card > summary::-webkit-details-marker { display: none; }
-    .bench-summary-main {
+    .bench-card > summary::-webkit-details-marker { display: none; }
+    .bench-head {
       min-width: 0;
       display: grid;
-      gap: 6px;
+      gap: 8px;
     }
-    .bench-line-top {
+    .bench-head-top {
       display: flex;
       gap: 10px;
       align-items: center;
+      justify-content: space-between;
       flex-wrap: wrap;
-      min-width: 0;
     }
     .bench-title-wrap {
       min-width: 0;
@@ -2635,8 +2633,8 @@ def home():
       gap: 10px;
       flex: 1;
     }
-    .bench-summary-title {
-      font-size: 1.1rem;
+    .bench-title {
+      font-size: 1.12rem;
       font-weight: 800;
       line-height: 1.15;
       min-width: 0;
@@ -2644,65 +2642,120 @@ def home():
       text-overflow: ellipsis;
       white-space: nowrap;
     }
-    .bench-summary-sub {
+    .bench-sub {
       color: var(--muted);
       font-size: 0.92rem;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
+      line-height: 1.3;
     }
-    .bench-summary-reading {
-      min-width: 160px;
+    .bench-kicker {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .mini-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 0.82rem;
+      font-weight: 700;
+      color: var(--muted);
+      background: rgba(255,255,255,0.78);
+      border: 1px solid var(--border);
+    }
+    .bench-reading {
+      min-width: 175px;
       text-align: right;
       display: grid;
-      gap: 3px;
+      gap: 4px;
     }
-    .bench-summary-value {
-      font-size: 1.25rem;
+    .bench-reading-value {
+      font-size: 1.9rem;
       font-weight: 800;
-      line-height: 1;
+      line-height: 0.96;
+      letter-spacing: -0.03em;
     }
-    .bench-summary-note {
+    .bench-reading-note {
       color: var(--muted);
-      font-size: 0.82rem;
+      font-size: 0.84rem;
+      line-height: 1.25;
     }
     .bench-body {
       padding: 0 16px 16px;
       border-top: 1px solid var(--border);
+      background: rgba(255,255,255,0.35);
       display: grid;
       gap: 12px;
-      background: rgba(255,255,255,0.35);
     }
-    .bench-actions {
+    .bench-toolbar {
       display: flex;
-      gap: 10px;
-      flex-wrap: wrap;
       justify-content: space-between;
+      gap: 12px;
       align-items: center;
+      flex-wrap: wrap;
       padding-top: 12px;
     }
-    .unit-strip {
+    .bench-updated {
+      color: var(--muted);
+      font-size: 0.86rem;
+    }
+    .hero-metrics {
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 10px;
     }
-    .unit-pill {
+    .detail-section {
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      background: rgba(255,255,255,0.86);
+      overflow: hidden;
+    }
+    .detail-section > summary {
+      list-style: none;
+      cursor: pointer;
+      padding: 12px 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.92) 0%, rgba(248,250,252,0.95) 100%);
+    }
+    .detail-section > summary::-webkit-details-marker { display: none; }
+    .detail-title {
+      font-size: 0.95rem;
+      font-weight: 800;
+      color: var(--text);
+    }
+    .detail-sub {
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+    .detail-body {
+      padding: 14px;
+      border-top: 1px solid var(--border);
+      display: grid;
+      gap: 12px;
+      background: rgba(255,255,255,0.5);
+    }
+    .temp-strip,
+    .quality-grid,
+    .voc-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 10px;
+    }
+    .unit-pill,
+    .quality-card {
       border: 1px solid var(--border);
       background: #fcfdff;
       border-radius: 14px;
-      padding: 10px 12px;
+      padding: 12px;
+      min-width: 0;
     }
-    .unit-pill .tiny { margin-bottom: 4px; display:block; }
-    .table-wrap {
-      border: 1px solid var(--border);
-      border-radius: 16px;
-      background: #fcfdff;
-      overflow: auto;
-    }
-    .plot-stack {
-      display: grid;
-      gap: 10px;
-    }
+    .unit-pill strong,
+    .quality-card .metric-value { display: block; }
     .ph-gauge-box {
       border: 1px solid var(--border);
       border-radius: 16px;
@@ -2713,45 +2766,52 @@ def home():
       width: 100%;
       display: block;
     }
-    .quality-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-      gap: 10px;
-    }
-    .quality-card {
+    .table-wrap {
       border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 12px;
+      border-radius: 16px;
       background: #fcfdff;
+      overflow: auto;
+    }
+    .empty-section {
+      color: var(--muted);
+      font-size: 0.92rem;
+      padding: 12px;
+    }
+
+    @media (max-width: 900px) {
+      .bench-grid { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+      .bench-reading-value { font-size: 1.65rem; }
     }
 
     @media (max-width: 760px) {
       .wrap { padding: 14px; }
       h1 { font-size: 1.65rem; }
-      .metrics, .metrics.two, .unit-strip, .quality-grid { grid-template-columns: 1fr; }
+      .metrics, .metrics.two, .hero-metrics, .temp-strip, .quality-grid, .voc-grid { grid-template-columns: 1fr; }
       .station summary { padding: 14px; align-items: flex-start; }
       .summary-right { justify-content: flex-start; }
-      .probe-grid { grid-template-columns: 1fr; }
-      .bench-sensor-card > summary { grid-template-columns: 1fr; }
-      .bench-summary-reading { text-align: left; min-width: 0; }
-      .station-meta, .bench-summary-sub { white-space: normal; }
+      .probe-grid, .bench-grid { grid-template-columns: 1fr; }
+      .bench-card > summary { grid-template-columns: 1fr; }
+      .bench-reading { text-align: left; min-width: 0; }
+      .station-meta, .bench-sub { white-space: normal; }
       .global-note { max-width: none; }
       .recent-table { font-size: 0.88rem; }
+      .button-row, .settings-actions { justify-content: flex-start; }
+      .bench-title { white-space: normal; }
     }
   </style>
 </head>
 <body>
-  <div class=\"wrap\">
-    <div class=\"topbar\">
+  <div class="wrap">
+    <div class="topbar">
       <div>
         <h1>Sensor Host</h1>
-        <div class=\"subhead\">Field stations refresh every 60 seconds · bench sensors refresh from cached background reads every 5 seconds</div>
+        <div class="subhead">Field stations refresh every 60 seconds · bench sensors refresh from cached background reads every 5 seconds</div>
       </div>
-      <div class=\"global-note\">Desktop keeps the technical view. Phone keeps cards compact and readable. Bench cards now support pH calibration trim, graph toggles, and JSON history for Grafana.</div>
+      <div class="global-note">Desktop stays lab-style and information rich. Collapsed cards stay compact, long sections toggle independently, graph range stays with the graph, and temperature unit controls only appear on the RTD card.</div>
     </div>
 
-    <div id=\"bench-slot\"></div>
-    <div id=\"content\" class=\"loading\">Loading dashboard…</div>
+    <div id="bench-slot"></div>
+    <div id="content" class="loading">Loading dashboard…</div>
   </div>
 
   <script>
@@ -2765,6 +2825,10 @@ def home():
         .replaceAll(">", "&gt;")
         .replaceAll('"', "&quot;")
         .replaceAll("'", "&#39;");
+    }
+
+    function isCompactView() {
+      return window.innerWidth <= 760;
     }
 
     function fmtPct(value) {
@@ -2841,23 +2905,23 @@ def home():
     }
     function renderPhGauge(ph) {
       const value = Number(ph);
-      if (!Number.isFinite(value)) return `<div class=\"recent-empty\">No live pH gauge yet.</div>`;
+      if (!Number.isFinite(value)) return `<div class="empty-section">No live pH gauge yet.</div>`;
       const clamped = clamp(value, 0, 14);
       const angle = -140 + (clamped / 14) * 280;
       const needle = polar(90, 92, 58, angle);
       return `
-        <div class=\"ph-gauge-box\">
-          <svg viewBox=\"0 0 180 120\" class=\"ph-gauge\" aria-label=\"pH gauge\">
-            <path d=\"${arcPath(90, 92, 58, -140, -20)}\" stroke=\"#e3b454\" stroke-width=\"12\" fill=\"none\" stroke-linecap=\"round\"></path>
-            <path d=\"${arcPath(90, 92, 58, -20, 20)}\" stroke=\"#8ac89d\" stroke-width=\"12\" fill=\"none\" stroke-linecap=\"round\"></path>
-            <path d=\"${arcPath(90, 92, 58, 20, 140)}\" stroke=\"#7fb0ff\" stroke-width=\"12\" fill=\"none\" stroke-linecap=\"round\"></path>
-            <line x1=\"90\" y1=\"92\" x2=\"${needle.x}\" y2=\"${needle.y}\" stroke=\"#16202a\" stroke-width=\"4\" stroke-linecap=\"round\"></line>
-            <circle cx=\"90\" cy=\"92\" r=\"6\" fill=\"#16202a\"></circle>
-            <text x=\"20\" y=\"112\" font-size=\"11\" fill=\"#667281\">Acidic</text>
-            <text x=\"84\" y=\"18\" font-size=\"11\" fill=\"#667281\">7</text>
-            <text x=\"128\" y=\"112\" font-size=\"11\" fill=\"#667281\">Basic</text>
+        <div class="ph-gauge-box">
+          <svg viewBox="0 0 180 120" class="ph-gauge" aria-label="pH gauge">
+            <path d="${arcPath(90, 92, 58, -140, -20)}" stroke="#e3b454" stroke-width="12" fill="none" stroke-linecap="round"></path>
+            <path d="${arcPath(90, 92, 58, -20, 20)}" stroke="#8ac89d" stroke-width="12" fill="none" stroke-linecap="round"></path>
+            <path d="${arcPath(90, 92, 58, 20, 140)}" stroke="#7fb0ff" stroke-width="12" fill="none" stroke-linecap="round"></path>
+            <line x1="90" y1="92" x2="${needle.x}" y2="${needle.y}" stroke="#16202a" stroke-width="4" stroke-linecap="round"></line>
+            <circle cx="90" cy="92" r="6" fill="#16202a"></circle>
+            <text x="20" y="112" font-size="11" fill="#667281">Acidic</text>
+            <text x="84" y="18" font-size="11" fill="#667281">7</text>
+            <text x="128" y="112" font-size="11" fill="#667281">Basic</text>
           </svg>
-          <div class=\"metric-note\">0–6.99 acidic · 7 neutral · 7.01–14 basic</div>
+          <div class="metric-note">0–6.99 acidic · 7 neutral · 7.01–14 basic</div>
         </div>
       `;
     }
@@ -2893,24 +2957,24 @@ def home():
       const key = `bench-card-open:${kind}`;
       const saved = localStorage.getItem(key);
       if (saved !== null) return saved === "1";
-      return window.innerWidth >= 900;
+      return !isCompactView();
     }
     function setBenchCardOpen(kind, open) {
       localStorage.setItem(`bench-card-open:${kind}`, open ? "1" : "0");
     }
-    function getBenchPlotOpen(kind, fallback = true) {
-      const key = `bench-plot-open:${kind}`;
+    function getBenchSectionOpen(kind, section, fallback) {
+      const key = `bench-section-open:${kind}:${section}`;
       const saved = localStorage.getItem(key);
       if (saved !== null) return saved === "1";
       return fallback;
     }
-    function setBenchPlotOpen(kind, open) {
-      localStorage.setItem(`bench-plot-open:${kind}`, open ? "1" : "0");
+    function setBenchSectionOpen(kind, section, open) {
+      localStorage.setItem(`bench-section-open:${kind}:${section}`, open ? "1" : "0");
     }
     function getTempPrimaryUnit() {
       const saved = localStorage.getItem("temp-primary-unit");
       if (saved === "f" || saved === "c") return saved;
-      return window.innerWidth <= 760 ? "f" : "c";
+      return isCompactView() ? "f" : "c";
     }
     function setTempPrimaryUnit(unit) {
       localStorage.setItem("temp-primary-unit", unit);
@@ -2918,42 +2982,42 @@ def home():
 
     function renderProbeSettings(station) {
       return station.probes.map((probe) => `
-        <div class=\"probe-settings-card\">
-          <div class=\"probe-settings-title\">${escapeHtml(probe.display_name || probe.probe_key)}</div>
-          <div class=\"fields\">
-            <label class=\"field\">
+        <div class="probe-settings-card">
+          <div class="probe-settings-title">${escapeHtml(probe.display_name || probe.probe_key)}</div>
+          <div class="fields">
+            <label class="field">
               <span>Probe name</span>
-              <input type=\"text\" data-probe-key=\"${escapeHtml(probe.probe_key)}\" data-probe-field=\"display_name\" value=\"${escapeHtml(probe.display_name)}\">
+              <input type="text" data-probe-key="${escapeHtml(probe.probe_key)}" data-probe-field="display_name" value="${escapeHtml(probe.display_name)}">
             </label>
-            <label class=\"field\">
+            <label class="field">
               <span>Location / note</span>
-              <input type=\"text\" data-probe-key=\"${escapeHtml(probe.probe_key)}\" data-probe-field=\"location_name\" value=\"${escapeHtml(probe.location_name || "")}\">
+              <input type="text" data-probe-key="${escapeHtml(probe.probe_key)}" data-probe-field="location_name" value="${escapeHtml(probe.location_name || "")}">
             </label>
-            <label class=\"field\">
+            <label class="field">
               <span>Danger low</span>
-              <input type=\"number\" step=\"0.1\" min=\"0\" max=\"100\" data-probe-key=\"${escapeHtml(probe.probe_key)}\" data-probe-field=\"danger_low\" value=\"${escapeHtml(probe.rules.danger_low)}\">
+              <input type="number" step="0.1" min="0" max="100" data-probe-key="${escapeHtml(probe.probe_key)}" data-probe-field="danger_low" value="${escapeHtml(probe.rules.danger_low)}">
             </label>
-            <label class=\"field\">
+            <label class="field">
               <span>Warn low</span>
-              <input type=\"number\" step=\"0.1\" min=\"0\" max=\"100\" data-probe-key=\"${escapeHtml(probe.probe_key)}\" data-probe-field=\"warn_low\" value=\"${escapeHtml(probe.rules.warn_low)}\">
+              <input type="number" step="0.1" min="0" max="100" data-probe-key="${escapeHtml(probe.probe_key)}" data-probe-field="warn_low" value="${escapeHtml(probe.rules.warn_low)}">
             </label>
-            <label class=\"field\">
+            <label class="field">
               <span>Target low</span>
-              <input type=\"number\" step=\"0.1\" min=\"0\" max=\"100\" data-probe-key=\"${escapeHtml(probe.probe_key)}\" data-probe-field=\"target_low\" value=\"${escapeHtml(probe.rules.target_low)}\">
+              <input type="number" step="0.1" min="0" max="100" data-probe-key="${escapeHtml(probe.probe_key)}" data-probe-field="target_low" value="${escapeHtml(probe.rules.target_low)}">
             </label>
-            <label class=\"field\">
+            <label class="field">
               <span>Target high</span>
-              <input type=\"number\" step=\"0.1\" min=\"0\" max=\"100\" data-probe-key=\"${escapeHtml(probe.probe_key)}\" data-probe-field=\"target_high\" value=\"${escapeHtml(probe.rules.target_high)}\">
+              <input type="number" step="0.1" min="0" max="100" data-probe-key="${escapeHtml(probe.probe_key)}" data-probe-field="target_high" value="${escapeHtml(probe.rules.target_high)}">
             </label>
-            <label class=\"field\">
+            <label class="field">
               <span>Warn high</span>
-              <input type=\"number\" step=\"0.1\" min=\"0\" max=\"100\" data-probe-key=\"${escapeHtml(probe.probe_key)}\" data-probe-field=\"warn_high\" value=\"${escapeHtml(probe.rules.warn_high)}\">
+              <input type="number" step="0.1" min="0" max="100" data-probe-key="${escapeHtml(probe.probe_key)}" data-probe-field="warn_high" value="${escapeHtml(probe.rules.warn_high)}">
             </label>
-            <label class=\"field\">
+            <label class="field">
               <span>Enabled</span>
-              <select data-probe-key=\"${escapeHtml(probe.probe_key)}\" data-probe-field=\"enabled\">
-                <option value=\"true\" ${probe.enabled ? "selected" : ""}>Visible</option>
-                <option value=\"false\" ${probe.enabled ? "" : "selected"}>Hidden</option>
+              <select data-probe-key="${escapeHtml(probe.probe_key)}" data-probe-field="enabled">
+                <option value="true" ${probe.enabled ? "selected" : ""}>Visible</option>
+                <option value="false" ${probe.enabled ? "" : "selected"}>Hidden</option>
               </select>
             </label>
           </div>
@@ -2964,55 +3028,55 @@ def home():
     function renderProbeCard(station, probe) {
       const hours = getProbeHours(station.station_id, probe.probe_key, station.default_hours || DEFAULT_HOURS);
       return `
-        <div class=\"probe-card ${escapeHtml(stateClass(probe.state))}\" data-station-id=\"${escapeHtml(station.station_id)}\" data-probe-key=\"${escapeHtml(probe.probe_key)}\">
-          <div class=\"probe-head\">
+        <div class="probe-card ${escapeHtml(stateClass(probe.state))}" data-station-id="${escapeHtml(station.station_id)}" data-probe-key="${escapeHtml(probe.probe_key)}">
+          <div class="probe-head">
             <div>
-              <h3 class=\"probe-name\">${escapeHtml(probe.display_name)}</h3>
-              <div class=\"probe-sub\">${escapeHtml(probe.location_name || "No location label yet")} · target ${escapeHtml(fmtRange(probe.rules))}</div>
+              <h3 class="probe-name">${escapeHtml(probe.display_name)}</h3>
+              <div class="probe-sub">${escapeHtml(probe.location_name || "No location label yet")} · target ${escapeHtml(fmtRange(probe.rules))}</div>
             </div>
-            <div class=\"pill ${escapeHtml(stateClass(probe.state))}\">${escapeHtml(probe.state?.text || "No data")}</div>
+            <div class="pill ${escapeHtml(stateClass(probe.state))}">${escapeHtml(probe.state?.text || "No data")}</div>
           </div>
 
-          <div class=\"metrics\">
-            <div class=\"metric\">
-              <div class=\"metric-label\">Current</div>
-              <div class=\"metric-value\">${escapeHtml(fmtPct(probe.current))}</div>
-              <div class=\"metric-note\">Live reading</div>
+          <div class="metrics">
+            <div class="metric">
+              <div class="metric-label">Current</div>
+              <div class="metric-value">${escapeHtml(fmtPct(probe.current))}</div>
+              <div class="metric-note">Live reading</div>
             </div>
-            <div class=\"metric\">
-              <div class=\"metric-label\">Average</div>
-              <div class=\"metric-value js-avg\">Loading…</div>
-              <div class=\"metric-note js-window-label\">Window ${escapeHtml(formatWindow(hours))}</div>
+            <div class="metric">
+              <div class="metric-label">Average</div>
+              <div class="metric-value js-avg">Loading…</div>
+              <div class="metric-note js-window-label">Window ${escapeHtml(formatWindow(hours))}</div>
             </div>
-            <div class=\"metric target-band\">
-              <div class=\"metric-label\">Target band</div>
-              <div class=\"metric-value\">${escapeHtml(fmtRange(probe.rules))}</div>
-              <div class=\"metric-note\">Editable in settings</div>
+            <div class="metric">
+              <div class="metric-label">Target band</div>
+              <div class="metric-value">${escapeHtml(fmtRange(probe.rules))}</div>
+              <div class="metric-note">Editable in settings</div>
             </div>
           </div>
 
-          <div class=\"plot-box\">
-            <img class=\"probe-plot\" alt=\"Graph for ${escapeHtml(probe.display_name)}\">
-            <div class=\"plot-controls\">
-              <div class=\"plot-summary\">Window for the historical graph only.</div>
-              <div class=\"range-wrap\">
+          <div class="plot-box">
+            <img class="probe-plot" alt="Graph for ${escapeHtml(probe.display_name)}">
+            <div class="plot-controls">
+              <div class="plot-summary">Window for the historical graph only.</div>
+              <div class="range-wrap">
                 <label>Window</label>
-                <select class=\"probe-range\">
-                  <option value=\"1\" ${hours === 1 ? "selected" : ""}>Last 1 hour</option>
-                  <option value=\"24\" ${hours === 24 ? "selected" : ""}>Last 24 hours</option>
-                  <option value=\"168\" ${hours === 168 ? "selected" : ""}>Last 7 days</option>
+                <select class="probe-range">
+                  <option value="1" ${hours === 1 ? "selected" : ""}>Last 1 hour</option>
+                  <option value="24" ${hours === 24 ? "selected" : ""}>Last 24 hours</option>
+                  <option value="168" ${hours === 168 ? "selected" : ""}>Last 7 days</option>
                 </select>
               </div>
             </div>
           </div>
 
-          <details class=\"tech\">
+          <details class="tech">
             <summary>Technical data</summary>
-            <div class=\"tech-grid\">
-              <div class=\"tech-item\"><div class=\"tiny\">Raw</div><div><strong>${escapeHtml(fmtRaw(probe.raw))}</strong></div></div>
-              <div class=\"tech-item\"><div class=\"tiny\">Valid points</div><div><strong class=\"js-points\">Loading…</strong></div></div>
-              <div class=\"tech-item\"><div class=\"tiny\">Minimum</div><div><strong class=\"js-min\">Loading…</strong></div></div>
-              <div class=\"tech-item\"><div class=\"tiny\">Maximum</div><div><strong class=\"js-max\">Loading…</strong></div></div>
+            <div class="tech-grid">
+              <div class="tech-item"><div class="tiny">Raw</div><div><strong>${escapeHtml(fmtRaw(probe.raw))}</strong></div></div>
+              <div class="tech-item"><div class="tiny">Valid points</div><div><strong class="js-points">Loading…</strong></div></div>
+              <div class="tech-item"><div class="tiny">Minimum</div><div><strong class="js-min">Loading…</strong></div></div>
+              <div class="tech-item"><div class="tiny">Maximum</div><div><strong class="js-max">Loading…</strong></div></div>
             </div>
           </details>
         </div>
@@ -3023,57 +3087,57 @@ def home():
       const open = loadExpandedState(station.station_id, station.is_collapsed);
       const shownProbes = station.probes.filter(p => p.enabled);
       return `
-        <details class=\"station\" data-station-id=\"${escapeHtml(station.station_id)}\" ${open ? "open" : ""}>
+        <details class="station" data-station-id="${escapeHtml(station.station_id)}" ${open ? "open" : ""}>
           <summary>
-            <div class=\"summary-left\">
-              <span class=\"status-dot ${escapeHtml(station.connectivity.state)}\"></span>
-              <div class=\"summary-text\">
-                <div class=\"station-name\">${escapeHtml(station.display_name)}</div>
-                <div class=\"station-meta\">${escapeHtml(station.description || "No unit description")} · ${escapeHtml(station.connectivity.label)} · updated ${escapeHtml(station.updated_ago)}</div>
+            <div class="summary-left">
+              <span class="status-dot ${escapeHtml(station.connectivity.state)}"></span>
+              <div class="summary-text">
+                <div class="station-name">${escapeHtml(station.display_name)}</div>
+                <div class="station-meta">${escapeHtml(station.description || "No unit description")} · ${escapeHtml(station.connectivity.label)} · updated ${escapeHtml(station.updated_ago)}</div>
               </div>
             </div>
-            <div class=\"summary-right\">
-              <div class=\"pill ${escapeHtml(stateClass(station.station_state))}\">${escapeHtml(station.station_state.text)}</div>
-              <div class=\"pill count-badge\">${shownProbes.length} probes${station.alert_count ? ` · ${station.alert_count} alert${station.alert_count > 1 ? "s" : ""}` : ""}</div>
+            <div class="summary-right">
+              <div class="pill ${escapeHtml(stateClass(station.station_state))}">${escapeHtml(station.station_state.text)}</div>
+              <div class="pill count-badge">${shownProbes.length} probes${station.alert_count ? ` · ${station.alert_count} alert${station.alert_count > 1 ? "s" : ""}` : ""}</div>
             </div>
           </summary>
-          <div class=\"station-body\">
-            <div class=\"station-info\">
+          <div class="station-body">
+            <div class="station-info">
               <div><strong>Station ID:</strong> ${escapeHtml(station.station_id)}</div>
               <div><strong>Updated:</strong> ${escapeHtml(station.updated_at)}</div>
             </div>
 
-            <details class=\"settings section-card\">
+            <details class="settings section-card">
               <summary>Edit names and thresholds</summary>
-              <div class=\"settings-wrap\" data-config-station=\"${escapeHtml(station.station_id)}\">
-                <div class=\"fields\">
-                  <label class=\"field\"><span>Unit name</span><input type=\"text\" data-station-field=\"display_name\" value=\"${escapeHtml(station.display_name)}\"></label>
-                  <label class=\"field\"><span>Unit description</span><input type=\"text\" data-station-field=\"description\" value=\"${escapeHtml(station.description || "")}\"></label>
-                  <label class=\"field\"><span>Default graph range</span>
-                    <select data-station-field=\"default_hours\">
-                      <option value=\"1\" ${Number(station.default_hours) === 1 ? "selected" : ""}>Last 1 hour</option>
-                      <option value=\"24\" ${Number(station.default_hours) === 24 ? "selected" : ""}>Last 24 hours</option>
-                      <option value=\"168\" ${Number(station.default_hours) === 168 ? "selected" : ""}>Last 7 days</option>
+              <div class="settings-wrap" data-config-station="${escapeHtml(station.station_id)}">
+                <div class="fields">
+                  <label class="field"><span>Unit name</span><input type="text" data-station-field="display_name" value="${escapeHtml(station.display_name)}"></label>
+                  <label class="field"><span>Unit description</span><input type="text" data-station-field="description" value="${escapeHtml(station.description || "")}"></label>
+                  <label class="field"><span>Default graph range</span>
+                    <select data-station-field="default_hours">
+                      <option value="1" ${Number(station.default_hours) === 1 ? "selected" : ""}>Last 1 hour</option>
+                      <option value="24" ${Number(station.default_hours) === 24 ? "selected" : ""}>Last 24 hours</option>
+                      <option value="168" ${Number(station.default_hours) === 168 ? "selected" : ""}>Last 7 days</option>
                     </select>
                   </label>
-                  <label class=\"field\"><span>Collapsed by default</span>
-                    <select data-station-field=\"is_collapsed\">
-                      <option value=\"false\" ${station.is_collapsed ? "" : "selected"}>Expanded</option>
-                      <option value=\"true\" ${station.is_collapsed ? "selected" : ""}>Collapsed</option>
+                  <label class="field"><span>Collapsed by default</span>
+                    <select data-station-field="is_collapsed">
+                      <option value="false" ${station.is_collapsed ? "" : "selected"}>Expanded</option>
+                      <option value="true" ${station.is_collapsed ? "selected" : ""}>Collapsed</option>
                     </select>
                   </label>
                 </div>
 
-                <div class=\"probe-settings\">${renderProbeSettings(station)}</div>
+                <div class="probe-settings">${renderProbeSettings(station)}</div>
 
-                <div class=\"settings-actions\">
-                  <div class=\"save-msg\" data-save-msg=\"${escapeHtml(station.station_id)}\"></div>
-                  <button type=\"button\" data-save-station=\"${escapeHtml(station.station_id)}\">Save settings</button>
+                <div class="settings-actions">
+                  <div class="save-msg" data-save-msg="${escapeHtml(station.station_id)}"></div>
+                  <button type="button" data-save-station="${escapeHtml(station.station_id)}">Save settings</button>
                 </div>
               </div>
             </details>
 
-            <div class=\"probe-grid\">${shownProbes.map(probe => renderProbeCard(station, probe)).join("")}</div>
+            <div class="probe-grid">${shownProbes.map(probe => renderProbeCard(station, probe)).join("")}</div>
           </div>
         </details>
       `;
@@ -3095,7 +3159,7 @@ def home():
     }
 
     function gatherStationPayload(stationId) {
-      const root = document.querySelector(`[data-config-station=\"${CSS.escape(stationId)}\"]`);
+      const root = document.querySelector(`[data-config-station="${CSS.escape(stationId)}"]`);
       const station = {};
       root.querySelectorAll("[data-station-field]").forEach(el => {
         const field = el.dataset.stationField;
@@ -3119,7 +3183,7 @@ def home():
     }
 
     async function saveStationConfig(stationId) {
-      const msg = document.querySelector(`[data-save-msg=\"${CSS.escape(stationId)}\"]`);
+      const msg = document.querySelector(`[data-save-msg="${CSS.escape(stationId)}"]`);
       msg.textContent = "Saving…";
       const payload = gatherStationPayload(stationId);
       const res = await fetch(`/api/config/${encodeURIComponent(stationId)}`, {
@@ -3150,122 +3214,225 @@ def home():
       }
     }
 
-    function renderBenchSensorCard(kind, title, subtitle, valueText = "Loading…", noteText = "Waiting for first sample…") {
+    function benchCardConfig(kind) {
+      return {
+        ph: {
+          title: "Bench pH Probe",
+          subtitle: "Atlas Surveyor through ADS1115 A0",
+          heroLabel: "pH",
+          live: "/api/ph-live",
+          metrics: "/api/ph-metrics",
+          recent: "/api/ph-recent?limit=25",
+          reset: "/api/ph-reset",
+          toggle: "/api/ph-collect-enabled",
+          cal: "/api/ph-calibration",
+          plot: "/plot/ph.svg",
+          mainValue: (live) => fmtPH(live.ph),
+          mainNote: (live) => live.collecting_enabled === false ? "Logging paused" : (live.voltage === null ? "Voltage —" : `Voltage ${fmtVoltage(live.voltage)}`),
+          currentMetric: (live) => fmtPH(live.ph),
+          averageMetric: (metrics) => metrics.avg === null ? "—" : fmtPH(metrics.avg),
+          minMetric: (metrics) => metrics.min === null ? "—" : fmtPH(metrics.min),
+          maxMetric: (metrics) => metrics.max === null ? "—" : fmtPH(metrics.max),
+          recentValue: (row) => fmtPH(row.ph),
+          recentAux: (row) => fmtVoltage(row.voltage)
+        },
+        temp: {
+          title: "Bench Temperature Probe",
+          subtitle: "Atlas EZO RTD on UART",
+          heroLabel: "RTD",
+          live: "/api/temp-live",
+          metrics: "/api/temp-metrics",
+          recent: "/api/temp-recent?limit=25",
+          reset: "/api/temp-reset",
+          plot: "/plot/temp.svg",
+          mainValue: (live) => formatTempPrimary(live),
+          mainNote: (live) => `${fmtTempF(live.temp_f)} · ${fmtTempK(live.temp_k)}`,
+          currentMetric: (live) => formatTempPrimary(live),
+          averageMetric: (metrics) => formatTempPrimary(metrics, true),
+          minMetric: (metrics) => metrics.min === null ? "—" : fmtTemp(metrics.min),
+          maxMetric: (metrics) => metrics.max === null ? "—" : fmtTemp(metrics.max),
+          recentValue: (row) => fmtTemp(row.temp_c),
+          recentAux: () => "RTD"
+        },
+        tds: {
+          title: "Bench TDS Probe",
+          subtitle: "Inland TDS meter through ADS1115 A1",
+          heroLabel: "TDS",
+          live: "/api/tds-live",
+          metrics: "/api/tds-metrics",
+          recent: "/api/tds-recent?limit=25",
+          reset: "/api/tds-reset",
+          plot: "/plot/tds.svg",
+          mainValue: (live) => fmtPPM(live.tds_ppm),
+          mainNote: (live) => `${fmtVoltage(live.voltage)} · comp ${fmtTemp(live.comp_temp_c)}`,
+          currentMetric: (live) => fmtPPM(live.tds_ppm),
+          averageMetric: (metrics) => metrics.avg === null ? "—" : fmtPPM(metrics.avg),
+          minMetric: (metrics) => metrics.min === null ? "—" : fmtPPM(metrics.min),
+          maxMetric: (metrics) => metrics.max === null ? "—" : fmtPPM(metrics.max),
+          recentValue: (row) => fmtPPM(row.tds_ppm),
+          recentAux: (row) => `${fmtVoltage(row.voltage)} · ${fmtTemp(row.comp_temp_c)}`
+        },
+        voc: {
+          title: "Bench VOC / eCO₂",
+          subtitle: "Adafruit SGP30 on I²C",
+          heroLabel: "Air quality",
+          live: "/api/voc-live",
+          metrics: "/api/voc-metrics",
+          recent: "/api/voc-recent?limit=25",
+          reset: "/api/voc-reset",
+          plot: "/plot/voc_eco2.svg",
+          plot2: "/plot/voc_tvoc.svg",
+          mainValue: (live) => fmtPPM(live.eco2_ppm),
+          mainNote: (live) => `TVOC ${fmtPPB(live.tvoc_ppb)}`,
+          currentMetric: (live) => fmtPPM(live.eco2_ppm),
+          averageMetric: (metrics) => metrics.avg_eco2 === null ? "—" : fmtPPM(metrics.avg_eco2),
+          minMetric: (metrics) => metrics.min_eco2 === null ? "—" : fmtPPM(metrics.min_eco2),
+          maxMetric: (metrics) => metrics.max_eco2 === null ? "—" : fmtPPM(metrics.max_eco2),
+          recentValue: (row) => `${fmtPPM(row.eco2_ppm)} · ${fmtPPB(row.tvoc_ppb)}`,
+          recentAux: () => "eCO₂ · TVOC"
+        }
+      }[kind];
+    }
+
+    function renderDetailSection(kind, sectionKey, title, subtitle, bodyHtml, defaultOpen) {
+      const open = getBenchSectionOpen(kind, sectionKey, defaultOpen);
+      return `
+        <details class="detail-section" data-kind="${escapeHtml(kind)}" data-section="${escapeHtml(sectionKey)}" ${open ? "open" : ""}>
+          <summary>
+            <div>
+              <div class="detail-title">${escapeHtml(title)}</div>
+              <div class="detail-sub">${escapeHtml(subtitle)}</div>
+            </div>
+            <div class="mini-chip">Toggle</div>
+          </summary>
+          <div class="detail-body">${bodyHtml}</div>
+        </details>
+      `;
+    }
+
+    function renderBenchSensorCard(kind) {
+      const cfg = benchCardConfig(kind);
       const open = getBenchCardOpen(kind);
       const hours = getBenchHours(kind, 24);
-      const plotOpen = getBenchPlotOpen(kind, kind !== "voc");
-      return `
-        <details class=\"bench-sensor-card nodata js-bench-card\" data-kind=\"${escapeHtml(kind)}\" ${open ? "open" : ""}>
-          <summary>
-            <div class=\"bench-summary-main\">
-              <div class=\"bench-line-top\">
-                <div class=\"bench-title-wrap\">
-                  <span class=\"status-dot offline js-bench-dot\" data-kind=\"${escapeHtml(kind)}\"></span>
-                  <div class=\"bench-summary-title\">${escapeHtml(title)}</div>
-                </div>
-                <div class=\"pill nodata js-bench-state\" data-kind=\"${escapeHtml(kind)}\">Starting…</div>
-              </div>
-              <div class=\"bench-summary-sub\">${escapeHtml(subtitle)}</div>
+      const graphDefault = !isCompactView();
+      const recentDefault = false;
+      const controlsDefault = kind === "ph" && !isCompactView();
+
+      const unitToggle = kind === "temp" ? `
+        <div class="segmented js-temp-unit-toggle">
+          <button type="button" data-temp-unit="c">°C main</button>
+          <button type="button" data-temp-unit="f">°F main</button>
+        </div>
+      ` : "";
+
+      const heroExtras = kind === "temp" ? `
+        <div class="temp-strip">
+          <div class="unit-pill"><span class="tiny">Current °C</span><strong class="js-temp-c">—</strong></div>
+          <div class="unit-pill"><span class="tiny">Current °F</span><strong class="js-temp-f">—</strong></div>
+          <div class="unit-pill"><span class="tiny">Current K</span><strong class="js-temp-k">—</strong></div>
+        </div>
+      ` : kind === "ph" ? `
+        <div class="js-ph-gauge-wrap"><div class="js-ph-gauge"></div></div>
+      ` : kind === "voc" ? `
+        <div class="voc-grid">
+          <div class="quality-card"><div class="metric-label">Current eCO₂</div><div class="metric-value js-voc-current-eco2">—</div><div class="metric-note">Equivalent CO₂</div></div>
+          <div class="quality-card"><div class="metric-label">Current TVOC</div><div class="metric-value js-voc-current-tvoc">—</div><div class="metric-note">Total VOC</div></div>
+          <div class="quality-card"><div class="metric-label">Average eCO₂</div><div class="metric-value js-voc-avg-eco2">—</div><div class="metric-note js-voc-window">Window ${formatWindow(hours)}</div></div>
+          <div class="quality-card"><div class="metric-label">Average TVOC</div><div class="metric-value js-voc-avg-tvoc">—</div><div class="metric-note">Rolling history</div></div>
+        </div>
+      ` : "";
+
+      const graphSection = renderDetailSection(kind, "graph", "History graph", "Time window only affects the graph below.", `
+        <div class="plot-box">
+          <img class="js-bench-plot" data-kind="${escapeHtml(kind)}" alt="${escapeHtml(cfg.title)} graph">
+          <div class="plot-controls">
+            <div class="plot-summary">Choose how much history to visualize.</div>
+            <div class="range-wrap">
+              <label>Window</label>
+              <select class="js-bench-range" data-kind="${escapeHtml(kind)}">
+                <option value="1" ${hours === 1 ? "selected" : ""}>Last 1 hour</option>
+                <option value="24" ${hours === 24 ? "selected" : ""}>Last 24 hours</option>
+                <option value="168" ${hours === 168 ? "selected" : ""}>Last 7 days</option>
+              </select>
             </div>
-            <div class=\"bench-summary-reading\">
-              <div class=\"bench-summary-value js-bench-summary-value\" data-kind=\"${escapeHtml(kind)}\">${escapeHtml(valueText)}</div>
-              <div class=\"bench-summary-note js-bench-summary-note\" data-kind=\"${escapeHtml(kind)}\">${escapeHtml(noteText)}</div>
+          </div>
+        </div>
+        ${kind === "voc" ? `<div class="plot-box"><img class="js-bench-plot-2" data-kind="${escapeHtml(kind)}" alt="${escapeHtml(cfg.title)} secondary graph"></div>` : ""}
+      `, graphDefault);
+
+      const recentSection = renderDetailSection(kind, "recent", "Recent logged changes", "Collapse this when you want a clean dashboard.", `
+        <div class="table-wrap">
+          <div class="empty-section js-bench-recent-empty" data-kind="${escapeHtml(kind)}">Loading…</div>
+          <table class="recent-table js-bench-recent-table" data-kind="${escapeHtml(kind)}" hidden>
+            <thead><tr><th>Time</th><th>Value</th><th>Aux</th></tr></thead>
+            <tbody class="js-bench-recent-body" data-kind="${escapeHtml(kind)}"></tbody>
+          </table>
+        </div>
+      `, recentDefault);
+
+      const controlsSection = renderDetailSection(kind, "controls", "Lab controls and quality", "Calibration, history reset, and data quality live here.", `
+        <div class="button-row">
+          ${kind === "ph" ? '<button type="button" class="ghost js-bench-toggle-ph">Pause pH</button>' : ''}
+          ${kind === "ph" ? '<button type="button" class="ghost js-ph-cal-btn">Trim pH…</button>' : ''}
+          ${kind === "ph" ? '<button type="button" class="ghost js-ph-cal-reset">Reset cal</button>' : ''}
+          <button type="button" class="secondary js-bench-reset" data-kind="${escapeHtml(kind)}">Reset history</button>
+          <div class="save-msg js-bench-error" data-kind="${escapeHtml(kind)}"></div>
+        </div>
+        <div class="quality-grid">
+          <div class="quality-card"><div class="tiny">Samples / read</div><div class="metric-value js-bench-samples" data-kind="${escapeHtml(kind)}">—</div></div>
+          <div class="quality-card"><div class="tiny">Valid points</div><div class="metric-value js-bench-points" data-kind="${escapeHtml(kind)}">—</div></div>
+          <div class="quality-card"><div class="tiny">Minimum</div><div class="metric-value js-bench-min" data-kind="${escapeHtml(kind)}">—</div></div>
+          <div class="quality-card"><div class="tiny">Maximum</div><div class="metric-value js-bench-max" data-kind="${escapeHtml(kind)}">—</div></div>
+          <div class="quality-card"><div class="tiny">Quality</div><div class="metric-value js-bench-quality" data-kind="${escapeHtml(kind)}">—</div></div>
+          <div class="quality-card"><div class="tiny">Calibration</div><div class="metric-value js-ph-cal-summary" data-kind="${escapeHtml(kind)}">—</div></div>
+        </div>
+      `, controlsDefault);
+
+      return `
+        <details class="bench-card nodata js-bench-card" data-kind="${escapeHtml(kind)}" ${open ? "open" : ""}>
+          <summary>
+            <div class="bench-head">
+              <div class="bench-head-top">
+                <div class="bench-title-wrap">
+                  <span class="status-dot offline js-bench-dot" data-kind="${escapeHtml(kind)}"></span>
+                  <div class="bench-title">${escapeHtml(cfg.title)}</div>
+                </div>
+                <div class="pill nodata js-bench-state" data-kind="${escapeHtml(kind)}">Starting…</div>
+              </div>
+              <div class="bench-sub">${escapeHtml(cfg.subtitle)}</div>
+              <div class="bench-kicker">
+                <div class="mini-chip">${escapeHtml(cfg.heroLabel)}</div>
+                <div class="mini-chip js-bench-updated" data-kind="${escapeHtml(kind)}">Waiting for first sample…</div>
+              </div>
+            </div>
+            <div class="bench-reading">
+              <div class="bench-reading-value js-bench-summary-value" data-kind="${escapeHtml(kind)}">Loading…</div>
+              <div class="bench-reading-note js-bench-summary-note" data-kind="${escapeHtml(kind)}">Waiting for first sample…</div>
             </div>
           </summary>
 
-          <div class=\"bench-body\">
-            <div class=\"bench-actions\">
-              <div class=\"tiny js-bench-updated\" data-kind=\"${escapeHtml(kind)}\">Waiting for first sample…</div>
-              <div class=\"settings-actions\" style=\"justify-content:flex-end;\">
-                <div class=\"segmented js-temp-unit-toggle\" ${kind === "temp" ? "" : "hidden"}>
-                  <button type=\"button\" data-temp-unit=\"c\">°C main</button>
-                  <button type=\"button\" data-temp-unit=\"f\">°F main</button>
-                </div>
+          <div class="bench-body">
+            <div class="bench-toolbar">
+              ${unitToggle}
+            </div>
+
+            <div class="hero-metrics">
+              <div class="metric">
+                <div class="metric-label">Current</div>
+                <div class="metric-value js-bench-current" data-kind="${escapeHtml(kind)}">Loading…</div>
+                <div class="metric-note js-bench-secondary" data-kind="${escapeHtml(kind)}">—</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label">Average</div>
+                <div class="metric-value js-bench-avg" data-kind="${escapeHtml(kind)}">Loading…</div>
+                <div class="metric-note js-bench-window" data-kind="${escapeHtml(kind)}">Window ${formatWindow(hours)}</div>
               </div>
             </div>
 
-            <div class=\"metrics two js-bench-metrics\" data-kind=\"${escapeHtml(kind)}\">
-              <div class=\"metric\">
-                <div class=\"metric-label\">Current</div>
-                <div class=\"metric-value js-bench-current\" data-kind=\"${escapeHtml(kind)}\">Loading…</div>
-                <div class=\"metric-note js-bench-secondary\" data-kind=\"${escapeHtml(kind)}\">—</div>
-              </div>
-              <div class=\"metric\">
-                <div class=\"metric-label\">Average</div>
-                <div class=\"metric-value js-bench-avg\" data-kind=\"${escapeHtml(kind)}\">Loading…</div>
-                <div class=\"metric-note js-bench-window\" data-kind=\"${escapeHtml(kind)}\">Window ${formatWindow(hours)}</div>
-              </div>
-            </div>
-
-            <div class=\"plot-stack js-ph-gauge-wrap\" ${kind === "ph" ? "" : "hidden"}>
-              <div class=\"js-ph-gauge\"></div>
-            </div>
-
-            <div class=\"unit-strip js-temp-units\" ${kind === "temp" ? "" : "hidden"}>
-              <div class=\"unit-pill\"><span class=\"tiny\">Current °C</span><strong class=\"js-temp-c\">—</strong></div>
-              <div class=\"unit-pill\"><span class=\"tiny\">Current °F</span><strong class=\"js-temp-f\">—</strong></div>
-              <div class=\"unit-pill\"><span class=\"tiny\">Current K</span><strong class=\"js-temp-k\">—</strong></div>
-            </div>
-
-            <div class=\"quality-grid js-voc-dual-metrics\" ${kind === "voc" ? "" : "hidden"}>
-              <div class=\"quality-card\"><div class=\"metric-label\">Current eCO₂</div><div class=\"metric-value js-voc-current-eco2\">—</div><div class=\"metric-note\">Equivalent CO₂</div></div>
-              <div class=\"quality-card\"><div class=\"metric-label\">Current TVOC</div><div class=\"metric-value js-voc-current-tvoc\">—</div><div class=\"metric-note\">Total VOC</div></div>
-              <div class=\"quality-card\"><div class=\"metric-label\">Average eCO₂</div><div class=\"metric-value js-voc-avg-eco2\">—</div><div class=\"metric-note js-voc-window\">Window ${formatWindow(hours)}</div></div>
-              <div class=\"quality-card\"><div class=\"metric-label\">Average TVOC</div><div class=\"metric-value js-voc-avg-tvoc\">—</div><div class=\"metric-note\">Rolling history</div></div>
-            </div>
-
-            <details class=\"plot-section js-bench-plot-section\" data-kind=\"${escapeHtml(kind)}\" ${plotOpen ? "open" : ""}>
-              <summary>History graph</summary>
-              <div class=\"plot-stack\" style=\"margin-top:10px;\">
-                <div class=\"plot-box js-bench-plot-wrap\" data-kind=\"${escapeHtml(kind)}\">
-                  <img class=\"js-bench-plot\" data-kind=\"${escapeHtml(kind)}\" alt=\"${escapeHtml(title)} graph\">
-                  <div class=\"plot-controls\">
-                    <div class=\"plot-summary\">Window changes this history graph only.</div>
-                    <div class=\"range-wrap js-bench-range-wrap\" data-kind=\"${escapeHtml(kind)}\">
-                      <label>Window</label>
-                      <select class=\"js-bench-range\" data-kind=\"${escapeHtml(kind)}\">
-                        <option value=\"1\" ${hours === 1 ? "selected" : ""}>Last 1 hour</option>
-                        <option value=\"24\" ${hours === 24 ? "selected" : ""}>Last 24 hours</option>
-                        <option value=\"168\" ${hours === 168 ? "selected" : ""}>Last 7 days</option>
-                      </select>
-                    </div>
-                  </div>
-                </div>
-                <div class=\"plot-box js-voc-plot-2\" ${kind === "voc" ? "" : "hidden"}>
-                  <img class=\"js-bench-plot-2\" data-kind=\"${escapeHtml(kind)}\" alt=\"${escapeHtml(title)} secondary graph\">
-                </div>
-              </div>
-            </details>
-
-            <div class=\"section-card\">
-              <div class=\"bench-actions\" style=\"padding-top:0;\">
-                <div class=\"metric-label\" style=\"margin:0;\">Quality, calibration, and controls</div>
-                <div class=\"settings-actions\" style=\"justify-content:flex-end;\">
-                  <div class=\"save-msg js-bench-error\" data-kind=\"${escapeHtml(kind)}\"></div>
-                  <button type=\"button\" class=\"ghost js-bench-toggle-ph\" ${kind === "ph" ? "" : "hidden"}>Pause pH</button>
-                  <button type=\"button\" class=\"ghost js-ph-cal-btn\" ${kind === "ph" ? "" : "hidden"}>Trim pH…</button>
-                  <button type=\"button\" class=\"ghost js-ph-cal-reset\" ${kind === "ph" ? "" : "hidden"}>Reset cal</button>
-                  <button type=\"button\" class=\"secondary js-bench-reset\" data-kind=\"${escapeHtml(kind)}\">Reset history</button>
-                </div>
-              </div>
-
-              <div class=\"quality-grid\">
-                <div class=\"quality-card\"><div class=\"tiny\">Samples / read</div><div><strong class=\"js-bench-samples\" data-kind=\"${escapeHtml(kind)}\">—</strong></div></div>
-                <div class=\"quality-card\"><div class=\"tiny\">Valid points</div><div><strong class=\"js-bench-points\" data-kind=\"${escapeHtml(kind)}\">—</strong></div></div>
-                <div class=\"quality-card\"><div class=\"tiny\">Minimum</div><div><strong class=\"js-bench-min\" data-kind=\"${escapeHtml(kind)}\">—</strong></div></div>
-                <div class=\"quality-card\"><div class=\"tiny\">Maximum</div><div><strong class=\"js-bench-max\" data-kind=\"${escapeHtml(kind)}\">—</strong></div></div>
-                <div class=\"quality-card\"><div class=\"tiny\">Quality</div><div><strong class=\"js-bench-quality\" data-kind=\"${escapeHtml(kind)}\">—</strong></div></div>
-                <div class=\"quality-card\"><div class=\"tiny\">Calibration</div><div><strong class=\"js-ph-cal-summary\" data-kind=\"${escapeHtml(kind)}\">—</strong></div></div>
-              </div>
-
-              <div class=\"table-wrap\" style=\"margin-top:12px;\">
-                <div class=\"recent-empty js-bench-recent-empty\" data-kind=\"${escapeHtml(kind)}\" style=\"padding:12px;\">Loading…</div>
-                <table class=\"recent-table js-bench-recent-table\" data-kind=\"${escapeHtml(kind)}\" hidden>
-                  <thead><tr><th>Time</th><th>Value</th><th>Aux</th></tr></thead>
-                  <tbody class=\"js-bench-recent-body\" data-kind=\"${escapeHtml(kind)}\"></tbody>
-                </table>
-              </div>
-            </div>
+            ${heroExtras}
+            ${graphSection}
+            ${recentSection}
+            ${controlsSection}
           </div>
         </details>
       `;
@@ -3274,106 +3441,42 @@ def home():
     function renderBenchPanel() {
       const open = loadExpandedState("bench_suite", false);
       return `
-        <details class=\"station\" data-station-id=\"bench_suite\" ${open ? "open" : ""}>
+        <details class="station" data-station-id="bench_suite" ${open ? "open" : ""}>
           <summary>
-            <div class=\"summary-left\">
-              <span class=\"status-dot online\"></span>
-              <div class=\"summary-text\">
-                <div class=\"station-name\">Bench Sensors</div>
-                <div class=\"station-meta\">pH, RTD temperature, TDS, and VOC refresh from cached background reads so the page stays quick and does not touch the hardware directly</div>
+            <div class="summary-left">
+              <span class="status-dot online"></span>
+              <div class="summary-text">
+                <div class="station-name">Bench Sensors</div>
+                <div class="station-meta">Card collapse controls the full sensor. Graphs, tables, and controls each have their own toggles so the layout stays compact when you want a dashboard view.</div>
               </div>
             </div>
-            <div class=\"summary-right\"><div class=\"pill count-badge\">Bench module</div></div>
+            <div class="summary-right"><div class="pill count-badge">Bench module</div></div>
           </summary>
-          <div class=\"station-body\">
-            <div class=\"probe-grid\">
-              ${renderBenchSensorCard("ph", "Bench pH Probe", "Atlas Surveyor through ADS1115 A0")}
-              ${renderBenchSensorCard("temp", "Bench Temperature Probe", "Atlas EZO RTD on UART")}
-              ${renderBenchSensorCard("tds", "Bench TDS Probe", "Inland TDS meter through ADS1115 A1")}
-              ${renderBenchSensorCard("voc", "Bench VOC / eCO₂", "Adafruit SGP30 on I²C")}
+          <div class="station-body">
+            <div class="bench-grid">
+              ${renderBenchSensorCard("ph")}
+              ${renderBenchSensorCard("temp")}
+              ${renderBenchSensorCard("tds")}
+              ${renderBenchSensorCard("voc")}
             </div>
           </div>
         </details>
       `;
     }
 
-    function benchConfig(kind) {
-      return {
-        ph: {
-          live: "/api/ph-live",
-          metrics: "/api/ph-metrics",
-          recent: "/api/ph-recent?limit=25",
-          reset: "/api/ph-reset",
-          toggle: "/api/ph-collect-enabled",
-          cal: "/api/ph-calibration",
-          plot: "/plot/ph.svg",
-          fmtMain: fmtPH,
-          fmtSummary: (live) => fmtPH(live.ph),
-          fmtAuxLive: (live) => live.collecting_enabled === false ? "Logging paused" : (live.voltage === null ? "Voltage —" : `Voltage ${fmtVoltage(live.voltage)}`),
-          fmtMinMax: fmtPH,
-          recentValue: (row) => fmtPH(row.ph),
-          recentAux: (row) => fmtVoltage(row.voltage),
-          valueKey: "ph",
-        },
-        temp: {
-          live: "/api/temp-live",
-          metrics: "/api/temp-metrics",
-          recent: "/api/temp-recent?limit=25",
-          reset: "/api/temp-reset",
-          plot: "/plot/temp.svg",
-          fmtMain: fmtTemp,
-          fmtSummary: (live) => fmtTemp(live.temp_c),
-          fmtAuxLive: (live) => `${fmtTempF(live.temp_f)} · ${fmtTempK(live.temp_k)}`,
-          fmtMinMax: fmtTemp,
-          recentValue: (row) => fmtTemp(row.temp_c),
-          recentAux: () => "RTD",
-          valueKey: "temp_c",
-        },
-        tds: {
-          live: "/api/tds-live",
-          metrics: "/api/tds-metrics",
-          recent: "/api/tds-recent?limit=25",
-          reset: "/api/tds-reset",
-          plot: "/plot/tds.svg",
-          fmtMain: fmtPPM,
-          fmtSummary: (live) => fmtPPM(live.tds_ppm),
-          fmtAuxLive: (live) => `${fmtVoltage(live.voltage)} · comp ${fmtTemp(live.comp_temp_c)}`,
-          fmtMinMax: fmtPPM,
-          recentValue: (row) => fmtPPM(row.tds_ppm),
-          recentAux: (row) => `${fmtVoltage(row.voltage)} · ${fmtTemp(row.comp_temp_c)}`,
-          valueKey: "tds_ppm",
-        },
-        voc: {
-          live: "/api/voc-live",
-          metrics: "/api/voc-metrics",
-          recent: "/api/voc-recent?limit=25",
-          reset: "/api/voc-reset",
-          plot: "/plot/voc_eco2.svg",
-          plot2: "/plot/voc_tvoc.svg",
-          fmtMain: fmtPPM,
-          fmtSummary: (live) => fmtPPM(live.eco2_ppm),
-          fmtAuxLive: (live) => `TVOC ${fmtPPB(live.tvoc_ppb)}`,
-          fmtMinMax: fmtPPM,
-          recentValue: (row) => `${fmtPPM(row.eco2_ppm)} · ${fmtPPB(row.tvoc_ppb)}`,
-          recentAux: () => "eCO₂ · TVOC",
-          valueKey: "eco2_ppm",
-        }
-      }[kind];
-    }
-
     function setBenchUnavailable(kind, message) {
-      const card = document.querySelector(`.js-bench-card[data-kind=\"${CSS.escape(kind)}\"]`);
+      const card = document.querySelector(`.js-bench-card[data-kind="${CSS.escape(kind)}"]`);
       if (!card) return;
       card.classList.remove("ok", "warn", "bad", "nodata");
       card.classList.add("nodata");
-      const dot = card.querySelector(`.js-bench-dot[data-kind=\"${CSS.escape(kind)}\"]`);
+      const dot = card.querySelector(`.js-bench-dot[data-kind="${CSS.escape(kind)}"]`);
       if (dot) dot.className = "status-dot offline js-bench-dot";
-      const state = card.querySelector(`.js-bench-state[data-kind=\"${CSS.escape(kind)}\"]`);
+      const state = card.querySelector(`.js-bench-state[data-kind="${CSS.escape(kind)}"]`);
       if (state) {
         state.className = "pill nodata js-bench-state";
         state.textContent = "Unavailable";
       }
-      const err = card.querySelector(`.js-bench-error[data-kind=\"${CSS.escape(kind)}\"]`);
+      const err = card.querySelector(`.js-bench-error[data-kind="${CSS.escape(kind)}"]`);
       if (err) err.textContent = message || "";
     }
 
@@ -3392,38 +3495,33 @@ def home():
     }
 
     async function refreshBenchCard(kind, full = false) {
-      const cfg = benchConfig(kind);
+      const cfg = benchCardConfig(kind);
       const live = await safeFetchJson(cfg.live);
-      const card = document.querySelector(`.js-bench-card[data-kind=\"${CSS.escape(kind)}\"]`);
+      const card = document.querySelector(`.js-bench-card[data-kind="${CSS.escape(kind)}"]`);
       if (!card) return;
 
       const cls = stateClass(live.state);
       card.classList.remove("ok", "warn", "bad", "nodata");
       card.classList.add(cls);
 
-      const dot = card.querySelector(`.js-bench-dot[data-kind=\"${CSS.escape(kind)}\"]`);
+      const dot = card.querySelector(`.js-bench-dot[data-kind="${CSS.escape(kind)}"]`);
       if (dot) dot.className = `status-dot ${live.ok ? "online" : "offline"} js-bench-dot`;
 
-      const state = card.querySelector(`.js-bench-state[data-kind=\"${CSS.escape(kind)}\"]`);
+      const state = card.querySelector(`.js-bench-state[data-kind="${CSS.escape(kind)}"]`);
       if (state) {
         state.className = `pill ${cls} js-bench-state`;
         state.textContent = live.state?.text || "Unavailable";
       }
 
-      if (kind === "temp") {
-        card.querySelector(`.js-bench-summary-value[data-kind=\"${CSS.escape(kind)}\"]`).textContent = formatTempPrimary(live);
-        card.querySelector(`.js-bench-current[data-kind=\"${CSS.escape(kind)}\"]`).textContent = formatTempPrimary(live);
-      } else {
-        card.querySelector(`.js-bench-summary-value[data-kind=\"${CSS.escape(kind)}\"]`).textContent = cfg.fmtSummary(live);
-        card.querySelector(`.js-bench-current[data-kind=\"${CSS.escape(kind)}\"]`).textContent = cfg.fmtMain(live[cfg.valueKey]);
-      }
-      card.querySelector(`.js-bench-summary-note[data-kind=\"${CSS.escape(kind)}\"]`).textContent = cfg.fmtAuxLive(live);
-      card.querySelector(`.js-bench-secondary[data-kind=\"${CSS.escape(kind)}\"]`).textContent = cfg.fmtAuxLive(live);
-      card.querySelector(`.js-bench-samples[data-kind=\"${CSS.escape(kind)}\"]`).textContent = String(Number(live.samples || 0));
-      card.querySelector(`.js-bench-updated[data-kind=\"${CSS.escape(kind)}\"]`).textContent = live.updated_at ? `Updated ${fmtDateTime(live.updated_at)}` : "Waiting for first sample…";
-      card.querySelector(`.js-bench-quality[data-kind=\"${CSS.escape(kind)}\"]`).textContent = live.quality || "—";
+      const mainValue = cfg.mainValue(live);
+      const mainNote = cfg.mainNote(live);
+      card.querySelector(`.js-bench-summary-value[data-kind="${CSS.escape(kind)}"]`).textContent = mainValue;
+      card.querySelector(`.js-bench-summary-note[data-kind="${CSS.escape(kind)}"]`).textContent = mainNote;
+      card.querySelector(`.js-bench-current[data-kind="${CSS.escape(kind)}"]`).textContent = cfg.currentMetric(live);
+      card.querySelector(`.js-bench-secondary[data-kind="${CSS.escape(kind)}"]`).textContent = mainNote;
+      card.querySelector(`.js-bench-updated[data-kind="${CSS.escape(kind)}"]`).textContent = live.updated_at ? `Updated ${fmtDateTime(live.updated_at)}` : "Waiting for first sample…";
 
-      const err = card.querySelector(`.js-bench-error[data-kind=\"${CSS.escape(kind)}\"]`);
+      const err = card.querySelector(`.js-bench-error[data-kind="${CSS.escape(kind)}"]`);
       if (err) err.textContent = live.error || "";
 
       if (kind === "temp") {
@@ -3443,71 +3541,68 @@ def home():
           calText += ` · target ${Number(cal.last_target).toFixed(2)}`;
         }
         if (cal.last_ts) calText += ` · ${fmtDateTime(cal.last_ts)}`;
-        card.querySelector(`.js-ph-cal-summary[data-kind=\"${CSS.escape(kind)}\"]`).textContent = calText;
+        card.querySelector(`.js-ph-cal-summary[data-kind="${CSS.escape(kind)}"]`).textContent = calText;
       } else if (kind === "voc") {
-        card.querySelector(`.js-ph-cal-summary[data-kind=\"${CSS.escape(kind)}\"]`).textContent = live.baseline_ready ? "Baseline learning" : "Warm-up";
-      } else {
-        card.querySelector(`.js-ph-cal-summary[data-kind=\"${CSS.escape(kind)}\"]`).textContent = kind === "temp" ? "RTD direct" : "No trim applied";
-      }
-
-      if (kind === "voc") {
+        card.querySelector(`.js-ph-cal-summary[data-kind="${CSS.escape(kind)}"]`).textContent = live.baseline_ready ? "Baseline learned" : "Warm-up";
         card.querySelector(".js-voc-current-eco2").textContent = fmtPPM(live.eco2_ppm);
         card.querySelector(".js-voc-current-tvoc").textContent = fmtPPB(live.tvoc_ppb);
+      } else if (kind === "temp") {
+        card.querySelector(`.js-ph-cal-summary[data-kind="${CSS.escape(kind)}"]`).textContent = "RTD direct";
+      } else {
+        card.querySelector(`.js-ph-cal-summary[data-kind="${CSS.escape(kind)}"]`).textContent = "No trim applied";
       }
 
       if (!full) return;
 
       const hours = getBenchHours(kind, 24);
       const metrics = await safeFetchJson(`${cfg.metrics}?hours=${hours}`);
-      if (kind === "temp") {
-        card.querySelector(`.js-bench-avg[data-kind=\"${CSS.escape(kind)}\"]`).textContent = formatTempPrimary(metrics, true);
-      } else if (kind !== "voc") {
-        card.querySelector(`.js-bench-avg[data-kind=\"${CSS.escape(kind)}\"]`).textContent = metrics.avg === null ? "—" : cfg.fmtMain(metrics.avg);
-      }
-      card.querySelector(`.js-bench-window[data-kind=\"${CSS.escape(kind)}\"]`).textContent = `Window ${formatWindow(hours)}`;
-      card.querySelector(`.js-bench-points[data-kind=\"${CSS.escape(kind)}\"]`).textContent = String(Number(metrics.points || 0));
+      card.querySelector(`.js-bench-avg[data-kind="${CSS.escape(kind)}"]`).textContent = cfg.averageMetric(metrics);
+      card.querySelector(`.js-bench-window[data-kind="${CSS.escape(kind)}"]`).textContent = `Window ${formatWindow(hours)}`;
+      card.querySelector(`.js-bench-samples[data-kind="${CSS.escape(kind)}"]`).textContent = String(Number(live.samples || 0));
+      card.querySelector(`.js-bench-points[data-kind="${CSS.escape(kind)}"]`).textContent = String(Number(metrics.points || 0));
+      card.querySelector(`.js-bench-min[data-kind="${CSS.escape(kind)}"]`).textContent = cfg.minMetric(metrics);
+      card.querySelector(`.js-bench-max[data-kind="${CSS.escape(kind)}"]`).textContent = cfg.maxMetric(metrics);
+      card.querySelector(`.js-bench-quality[data-kind="${CSS.escape(kind)}"]`).textContent = live.quality || "—";
 
       if (kind === "voc") {
-        card.querySelector(`.js-bench-min[data-kind=\"${CSS.escape(kind)}\"]`).textContent = metrics.min_eco2 === null ? "—" : fmtPPM(metrics.min_eco2);
-        card.querySelector(`.js-bench-max[data-kind=\"${CSS.escape(kind)}\"]`).textContent = metrics.max_eco2 === null ? "—" : fmtPPM(metrics.max_eco2);
         card.querySelector(".js-voc-avg-eco2").textContent = metrics.avg_eco2 === null ? "—" : fmtPPM(metrics.avg_eco2);
         card.querySelector(".js-voc-avg-tvoc").textContent = metrics.avg_tvoc === null ? "—" : fmtPPB(metrics.avg_tvoc);
         card.querySelector(".js-voc-window").textContent = `Window ${formatWindow(hours)}`;
-      } else {
-        card.querySelector(`.js-bench-min[data-kind=\"${CSS.escape(kind)}\"]`).textContent = metrics.min === null ? "—" : cfg.fmtMinMax(metrics.min);
-        card.querySelector(`.js-bench-max[data-kind=\"${CSS.escape(kind)}\"]`).textContent = metrics.max === null ? "—" : cfg.fmtMinMax(metrics.max);
       }
 
-      const plotSection = card.querySelector(`.js-bench-plot-section[data-kind=\"${CSS.escape(kind)}\"]`);
-      const plot = card.querySelector(`.js-bench-plot[data-kind=\"${CSS.escape(kind)}\"]`);
-      if (cfg.plot && plot && plotSection && plotSection.open) {
+      const graphSection = card.querySelector(`.detail-section[data-kind="${CSS.escape(kind)}"][data-section="graph"]`);
+      const plot = card.querySelector(`.js-bench-plot[data-kind="${CSS.escape(kind)}"]`);
+      if (cfg.plot && plot && graphSection && graphSection.open) {
         plot.src = `${cfg.plot}?hours=${hours}&_=${Date.now()}`;
       }
       if (kind === "voc") {
-        const plot2 = card.querySelector(`.js-bench-plot-2[data-kind=\"${CSS.escape(kind)}\"]`);
-        if (cfg.plot2 && plot2 && plotSection && plotSection.open) {
+        const plot2 = card.querySelector(`.js-bench-plot-2[data-kind="${CSS.escape(kind)}"]`);
+        if (cfg.plot2 && plot2 && graphSection && graphSection.open) {
           plot2.src = `${cfg.plot2}?hours=${hours}&_=${Date.now()}`;
         }
       }
 
-      const recent = await safeFetchJson(cfg.recent);
-      const empty = card.querySelector(`.js-bench-recent-empty[data-kind=\"${CSS.escape(kind)}\"]`);
-      const table = card.querySelector(`.js-bench-recent-table[data-kind=\"${CSS.escape(kind)}\"]`);
-      const body = card.querySelector(`.js-bench-recent-body[data-kind=\"${CSS.escape(kind)}\"]`);
-      if (!recent.length) {
-        empty.hidden = false;
-        table.hidden = true;
-        empty.textContent = "No logged changes yet.";
-      } else {
-        empty.hidden = true;
-        table.hidden = false;
-        body.innerHTML = recent.map(row => `
-          <tr>
-            <td>${escapeHtml(fmtDateTime(row.ts))}</td>
-            <td>${escapeHtml(cfg.recentValue(row))}</td>
-            <td>${escapeHtml(cfg.recentAux(row))}</td>
-          </tr>
-        `).join("");
+      const recentSection = card.querySelector(`.detail-section[data-kind="${CSS.escape(kind)}"][data-section="recent"]`);
+      if (recentSection && recentSection.open) {
+        const recent = await safeFetchJson(cfg.recent);
+        const empty = card.querySelector(`.js-bench-recent-empty[data-kind="${CSS.escape(kind)}"]`);
+        const table = card.querySelector(`.js-bench-recent-table[data-kind="${CSS.escape(kind)}"]`);
+        const body = card.querySelector(`.js-bench-recent-body[data-kind="${CSS.escape(kind)}"]`);
+        if (!recent.length) {
+          empty.hidden = false;
+          table.hidden = true;
+          empty.textContent = "No logged changes yet.";
+        } else {
+          empty.hidden = true;
+          table.hidden = false;
+          body.innerHTML = recent.map(row => `
+            <tr>
+              <td>${escapeHtml(fmtDateTime(row.ts))}</td>
+              <td>${escapeHtml(cfg.recentValue(row))}</td>
+              <td>${escapeHtml(cfg.recentAux(row))}</td>
+            </tr>
+          `).join("");
+        }
       }
     }
 
@@ -3535,9 +3630,9 @@ def home():
         card.addEventListener('toggle', () => setBenchCardOpen(card.dataset.kind, card.open));
       });
 
-      slot.querySelectorAll('.js-bench-plot-section').forEach(section => {
+      slot.querySelectorAll('.detail-section').forEach(section => {
         section.addEventListener('toggle', async () => {
-          setBenchPlotOpen(section.dataset.kind, section.open);
+          setBenchSectionOpen(section.dataset.kind, section.dataset.section, section.open);
           if (section.open) await refreshBenchCard(section.dataset.kind, true);
         });
       });
@@ -3554,7 +3649,7 @@ def home():
       slot.addEventListener("click", async (event) => {
         if (event.target.matches(".js-bench-reset")) {
           const kind = event.target.dataset.kind;
-          await safeFetchJson(benchConfig(kind).reset, 6000, { method: "POST" });
+          await safeFetchJson(benchCardConfig(kind).reset, 6000, { method: "POST" });
           await refreshBenchCard(kind, true);
         }
 
@@ -3647,7 +3742,7 @@ def home():
   </script>
 </body>
 </html>
-"""
+'''
     html = html.replace("__DEFAULT_HOURS__", json.dumps(DEFAULT_HOURS))
     html = html.replace("__ALLOWED_WINDOWS__", json.dumps(ALLOWED_WINDOWS))
     return Response(html, mimetype="text/html")
